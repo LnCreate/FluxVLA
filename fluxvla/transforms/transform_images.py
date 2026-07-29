@@ -951,17 +951,16 @@ class SimpleNormalizeImages:
 
     def __call__(self, data: dict):
         assert 'images' in data, "Input data must contain 'images' key"
-        images = data['images'].reshape(-1, 3, data['images'].shape[-2],
-                                        data['images'].shape[-1])
+        images = np.asarray(data['images'], dtype=np.float32)
+        images = images.reshape(-1, 3, images.shape[-2], images.shape[-1])
 
-        normalized_images = list()
-        for image in images:
-            # Divide by 255 to get [0, 1], then map to [-1, 1]
-            normalized_image = (image / 255.0) * 2.0 - 1.0
-            normalized_images.append(normalized_image)
-
-        normalized_images = np.concatenate(normalized_images, axis=0)
-        data['images'] = normalized_images
+        # Keep this host-side tensor float32. NumPy promotes uint8 division by
+        # a Python float to float64 on some versions, doubling collation memory
+        # for long Cosmos3 video windows.
+        normalized_images = images * np.float32(2.0 / 255.0) - np.float32(1.0)
+        data['images'] = normalized_images.reshape(
+            -1, images.shape[-2], images.shape[-1]).astype(
+                np.float32, copy=False)
         return data
 
 

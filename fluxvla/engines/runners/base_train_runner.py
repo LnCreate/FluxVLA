@@ -37,6 +37,146 @@ from ..utils import (build_evaluator_from_cfg, build_lr_scheduler_from_cfg,
 
 overwatch = initialize_overwatch(__name__)
 
+OPTIMIZER_PARAM_GROUP_TOPOLOGY_KEY = 'optimizer_param_group_topology'
+OPTIMIZER_PARAM_GROUP_TOPOLOGY_VERSION = 1
+
+
+class OptimizerParamGroupTopologyError(RuntimeError):
+    """Raised when a checkpoint optimizer cannot match the current model."""
+
+
+class SchedulerParamGroupTopologyError(RuntimeError):
+    """Raised when scheduler state has a different optimizer group count."""
+
+
+def _canonical_optimizer_param_name(name: str) -> str:
+    """Remove runtime wrapper segments from an optimizer parameter name."""
+    wrapper_segments = (
+        'module.',
+        '_fsdp_wrapped_module.',
+        '_checkpoint_wrapped_module.',
+        '_orig_mod.',
+    )
+    canonical = name
+    changed = True
+    while changed:
+        changed = False
+        for segment in wrapper_segments:
+            if canonical.startswith(segment):
+                canonical = canonical.removeprefix(segment)
+                changed = True
+            nested = f'.{segment}'
+            if nested in canonical:
+                canonical = canonical.replace(nested, '.')
+                changed = True
+    return canonical
+
+
+def build_optimizer_param_group_topology(model: torch.nn.Module,
+                                         optimizer) -> Dict:
+    """Describe exact parameter membership/order for every optimizer group."""
+    name_by_parameter_id = {}
+    for name, parameter in model.named_parameters():
+        canonical_name = _canonical_optimizer_param_name(name)
+        parameter_id = id(parameter)
+        previous = name_by_parameter_id.get(parameter_id)
+        if previous is not None and previous != canonical_name:
+            raise OptimizerParamGroupTopologyError(
+                'A model parameter has multiple canonical optimizer names: '
+                f'{previous!r} and {canonical_name!r}.')
+        name_by_parameter_id[parameter_id] = canonical_name
+
+    groups = []
+    for group_index, group in enumerate(optimizer.param_groups):
+        parameter_names = []
+        for parameter in group['params']:
+            parameter_name = name_by_parameter_id.get(id(parameter))
+            if parameter_name is None:
+                raise OptimizerParamGroupTopologyError(
+                    'Optimizer group contains a parameter that is not '
+                    f'present in model.named_parameters() (group '
+                    f'{group_index}).')
+            parameter_names.append(parameter_name)
+        groups.append({'parameter_names': parameter_names})
+
+    return {
+        'version': OPTIMIZER_PARAM_GROUP_TOPOLOGY_VERSION,
+        'param_groups': groups,
+    }
+
+
+def validate_optimizer_param_group_topology(checkpoint_topology: Dict,
+                                            current_topology: Dict) -> None:
+    """Require identical optimizer group count, membership, and ordering."""
+    if not isinstance(checkpoint_topology, dict):
+        raise OptimizerParamGroupTopologyError(
+            f'Checkpoint is missing {OPTIMIZER_PARAM_GROUP_TOPOLOGY_KEY!r}; '
+            'strict optimizer resume is unavailable for this checkpoint.')
+    checkpoint_version = checkpoint_topology.get('version')
+    if checkpoint_version != OPTIMIZER_PARAM_GROUP_TOPOLOGY_VERSION:
+        raise OptimizerParamGroupTopologyError(
+            'Unsupported optimizer topology version: '
+            f'{checkpoint_version!r}.')
+
+    checkpoint_groups = checkpoint_topology.get('param_groups')
+    current_groups = current_topology.get('param_groups')
+    if not isinstance(checkpoint_groups, list):
+        raise OptimizerParamGroupTopologyError(
+            'Checkpoint optimizer topology has no param_groups list.')
+    if len(checkpoint_groups) != len(current_groups):
+        raise OptimizerParamGroupTopologyError(
+            'Optimizer param-group count mismatch: checkpoint has '
+            f'{len(checkpoint_groups)}, current run has '
+            f'{len(current_groups)}.')
+
+    for group_index, (checkpoint_group, current_group) in enumerate(
+            zip(checkpoint_groups, current_groups)):
+        checkpoint_names = checkpoint_group.get('parameter_names')
+        current_names = current_group.get('parameter_names')
+        if checkpoint_names != current_names:
+            checkpoint_names = checkpoint_names or []
+            current_names = current_names or []
+            mismatch_index = next(
+                (index for index, (checkpoint_name, current_name) in enumerate(
+                    zip(checkpoint_names, current_names))
+                 if checkpoint_name != current_name),
+                min(len(checkpoint_names), len(current_names)),
+            )
+            checkpoint_name = (
+                checkpoint_names[mismatch_index]
+                if mismatch_index < len(checkpoint_names) else '<missing>')
+            current_name = (
+                current_names[mismatch_index]
+                if mismatch_index < len(current_names) else '<missing>')
+            raise OptimizerParamGroupTopologyError(
+                f'Optimizer param-group {group_index} differs at parameter '
+                f'{mismatch_index}: checkpoint={checkpoint_name!r}, '
+                f'current={current_name!r}.')
+
+
+def validate_scheduler_state_param_groups(scheduler_state: Dict,
+                                          expected_groups: int) -> None:
+    """Reject scheduler state whose per-group arrays do not match optimizer."""
+    if not isinstance(scheduler_state, dict):
+        raise SchedulerParamGroupTopologyError(
+            'Scheduler checkpoint state must be a dictionary.')
+    for key in ('base_lrs', '_last_lr'):
+        values = scheduler_state.get(key)
+        if values is not None and len(values) != expected_groups:
+            raise SchedulerParamGroupTopologyError(
+                f'Scheduler {key} group count mismatch: checkpoint has '
+                f'{len(values)}, current optimizer has {expected_groups}.')
+
+
+def load_scheduler_state_strict(lr_scheduler, scheduler_state: Dict,
+                                optimizer) -> None:
+    """Load scheduler state only when its optimizer topology is compatible."""
+    expected_groups = len(optimizer.param_groups)
+    validate_scheduler_state_param_groups(scheduler_state, expected_groups)
+    lr_scheduler.load_state_dict(scheduler_state)
+    validate_scheduler_state_param_groups(lr_scheduler.state_dict(),
+                                          expected_groups)
+
 
 class BaseTrainRunner(ABC):
     """Basic class for training VLA models.
@@ -402,53 +542,66 @@ class BaseTrainRunner(ABC):
         if 'epoch' in checkpoint_info:
             self.current_epoch = checkpoint_info['epoch']
 
-        # Restore optimizer state (delegated to subclasses)
-        # Store checkpoint_info as instance variable for subclasses to access
-        # additional information (e.g., parameter mappings)
-        if ('optimizer_state_dict' in checkpoint_info
-                and self.optimizer is not None):
-            checkpoint_optimizer_state = checkpoint_info[
-                'optimizer_state_dict']
-            # Store checkpoint_info temporarily for _load_optimizer_state
-            # to access
-            self._current_checkpoint_info = checkpoint_info
-            try:
-                success = self._load_optimizer_state(
-                    checkpoint_optimizer_state)
-                if not success:
-                    if overwatch.is_rank_zero():
-                        overwatch.warning(
-                            'Failed to load optimizer state. '
-                            'Training will continue with fresh optimizer '
-                            'state.')
-            except Exception as e:
-                if overwatch.is_rank_zero():
-                    overwatch.warning(
-                        f'Error loading optimizer state: {e}. '
-                        f'Training will continue with fresh optimizer state.')
-            finally:
-                # Clean up temporary instance variable
-                self._current_checkpoint_info = None
-                # Ensure all ranks synchronize even if loading failed
-                # This prevents deadlock if some ranks succeed and others fail
-                dist.barrier()
-
-        # Restore scheduler state
-        if ('scheduler_state_dict' in checkpoint_info
-                and self.lr_scheduler is not None):
-            try:
-                self.lr_scheduler.load_state_dict(
-                    checkpoint_info['scheduler_state_dict'])
-                if overwatch.is_rank_zero():
-                    overwatch.info('Scheduler state restored from checkpoint')
-            except Exception as e:
-                overwatch.warning(f'Failed to load scheduler state: {e}')
+        self._restore_optimizer_and_scheduler(checkpoint_info)
 
         if overwatch.is_rank_zero():
             overwatch.info(
                 f'Resumed training from step {self.metric.global_step}, '
                 f'epoch {self.current_epoch}')
         dist.barrier()
+
+    def _optimizer_param_group_topology(self) -> Dict:
+        if self.optimizer is None:
+            raise OptimizerParamGroupTopologyError(
+                'Optimizer must be initialized before topology inspection.')
+        return build_optimizer_param_group_topology(self.vla, self.optimizer)
+
+    def _scheduler_state_for_checkpoint(self) -> Dict:
+        if self.lr_scheduler is None:
+            return {}
+        scheduler_state = self.lr_scheduler.state_dict()
+        validate_scheduler_state_param_groups(scheduler_state,
+                                              len(self.optimizer.param_groups))
+        return scheduler_state
+
+    def _restore_optimizer_and_scheduler(self, checkpoint_info: Dict) -> None:
+        """Restore exact optimizer/scheduler state or abort the resume."""
+        if self.optimizer is None:
+            raise RuntimeError('Optimizer must be initialized before resume.')
+        if 'optimizer_state_dict' not in checkpoint_info:
+            raise KeyError(
+                'Checkpoint has no optimizer_state_dict; strict training '
+                'resume requires complete optimizer state.')
+
+        checkpoint_topology = checkpoint_info.get(
+            OPTIMIZER_PARAM_GROUP_TOPOLOGY_KEY)
+        validate_optimizer_param_group_topology(
+            checkpoint_topology, self._optimizer_param_group_topology())
+
+        self._current_checkpoint_info = checkpoint_info
+        try:
+            success = self._load_optimizer_state(
+                checkpoint_info['optimizer_state_dict'])
+        finally:
+            self._current_checkpoint_info = None
+        if not success:
+            raise RuntimeError(
+                'Optimizer state restoration failed; refusing to continue '
+                'with a fresh optimizer during strict resume.')
+        self.optimizer_state_loaded = True
+
+        if self.lr_scheduler is not None:
+            if 'scheduler_state_dict' not in checkpoint_info:
+                raise KeyError(
+                    'Checkpoint has no scheduler_state_dict; strict training '
+                    'resume requires complete scheduler state.')
+            load_scheduler_state_strict(
+                self.lr_scheduler,
+                checkpoint_info['scheduler_state_dict'],
+                self.optimizer,
+            )
+            if overwatch.is_rank_zero():
+                overwatch.info('Scheduler state restored from checkpoint')
 
     def _should_save_step_checkpoint(self) -> bool:
         """Check if checkpoint should be saved (step-based)."""
@@ -896,6 +1049,11 @@ class BaseTrainRunner(ABC):
             self.optimizer.step()
         except RuntimeError as e:
             if 'size' in str(e).lower() or 'shape' in str(e).lower():
+                if self.optimizer_state_loaded:
+                    raise RuntimeError(
+                        'A restored optimizer state failed during a training '
+                        'step; refusing to replace it with a fresh optimizer '
+                        'during strict resume.') from e
                 self._reinit_optimizer()
                 self.optimizer.step()
             else:

@@ -228,7 +228,6 @@ class ProcessParquetInputs():
         inputs = dict()
         # Check if the video path is provided in the info
         assert 'video_path' in info, "Input data must contain 'video_path' key"
-        video_root_path = info['video_path']
         for key in self.parquet_keys:
             try:
                 value = data[key]
@@ -257,26 +256,36 @@ class ProcessParquetInputs():
         images = list()
         img_masks = list()
         timestamps = data.get('frame_timestamps', [data['timestamp']])
+        episode_meta = data.get('episode_meta', {})
         for video_key in self.video_keys:
-            episode_chunk = data['episode_index'] // data['info'][
-                'chunks_size']  # noqa: E501
-            video_path = os.path.join(
+            video_path = build_lerobot_video_path(
                 data['data_root'],
-                video_root_path.format(
-                    episode_chunk=episode_chunk,
-                    video_key=video_key,
-                    episode_index=data['episode_index']))
+                info,
+                episode_meta,
+                int(data['episode_index']),
+                video_key,
+            )
             assert os.path.exists(
                 video_path), f'Video file not found: {video_path}'
+            # LeRobot v3 may concatenate multiple episodes into one MP4. Its
+            # parquet timestamps are episode-local while the video decoder
+            # expects file-local timestamps, so apply the per-camera offset.
+            timestamp_offset = float(
+                episode_meta.get(
+                    f'videos/{video_key}/from_timestamp', 0.0))
+            query_timestamps = [
+                float(timestamp) + timestamp_offset
+                for timestamp in timestamps
+            ]
             # Load all requested timestamps at once (supports temporal window)
-            unique_ts = sorted(set(timestamps))
+            unique_ts = sorted(set(query_timestamps))
             frames_tensor = self.decode_video_frames_torchvision(
                 video_path, unique_ts, 0.1)
             ts_to_frame = {
                 ts: frames_tensor[i]
                 for i, ts in enumerate(unique_ts)
             }
-            for ts in timestamps:
+            for ts in query_timestamps:
                 nearest = min(unique_ts, key=lambda x: abs(x - ts))
                 images.append(ts_to_frame[nearest].numpy())
             for _ in timestamps:
