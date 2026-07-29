@@ -68,6 +68,14 @@ setup(
     long_description_content_type='text/markdown',
     url=None,
     packages=find_packages(),
+    package_data={
+        'fluxvla.models.third_party_models.cosmos3': [
+            'ATTRIBUTION.txt',
+            'LICENSE',
+            'NOTICE',
+        ],
+    },
+    include_package_data=True,
     classifiers=[
         'Programming Language :: Python :: 3',
         'Operating System :: OS Independent',

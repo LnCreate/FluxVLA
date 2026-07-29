@@ -179,6 +179,10 @@ def forward(self, x: torch.Tensor) -> torch.Tensor:
 
 
 def replace_vit_attn_with_flash_attn():
+    # Registry imports must remain usable for config inspection and CPU unit
+    # tests. FlashAttention is installed only when a CUDA runtime is live.
+    if not torch.cuda.is_available():
+        return
     cuda_major, cuda_minor = torch.cuda.get_device_capability()
     if cuda_major < 8:
         warnings.warn(
