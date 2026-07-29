@@ -50,7 +50,10 @@ _wan22_vae_path = _ckpt_root + '/Wan2.2-TI2V-5B/Wan2.2_VAE.pth'
 _action_dim = 14
 _max_action_dim = 64
 _max_state_dim = 64
-_embodiment_id = 21  # Config-local fine-tuning slot for action projector.
+# Domain 21 is assigned to TRON2 by the official Cosmos table.  Domain 31 is
+# reserved here as a FluxVLA-local ALOHA slot until an upstream assignment is
+# available.
+_embodiment_id = 31
 _action_horizon = 32
 _frame_window_size = _action_horizon + 1
 _prepend_state_to_action = True
