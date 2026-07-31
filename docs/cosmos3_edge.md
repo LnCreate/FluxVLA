@@ -1,7 +1,8 @@
 # Cosmos3-Edge in FluxVLA
 
-FluxVLA reuses `Cosmos3FlowMatching` for Cosmos3-Edge. Nano/Super use the
-Qwen3-VL backbone; Edge uses the Nemotron-3 Dense VL generation backbone.
+FluxVLA reuses `Cosmos3FlowMatching` and `Cosmos3MoTBackbone` for all Cosmos3
+variants. The backbone selects Qwen3-VL for Nano/Super and Nemotron-3 Dense VL
+for Edge from `vlm_config.model_type`.
 
 ## Supported scope
 
@@ -11,8 +12,8 @@ Qwen3-VL backbone; Edge uses the Nemotron-3 Dense VL generation backbone.
   projector width with embodiment domain 5.
 - H16 joint video/action flow-matching training.
 
-The current Edge backbone implements the Nemotron generator/policy tower. It
-does not implement the SigLIP2 reasoner visual tower or autoregressive reasoner
+The current Edge configuration enables the Nemotron generator/policy tower. It
+does not enable the SigLIP2 reasoner visual tower or autoregressive reasoner
 generation.
 
 ## Checkpoints
@@ -80,5 +81,5 @@ Diffusers-format base transformer.
 ## Licensing
 
 The adapted Nemotron/RMSNorm/ReLU²/mRoPE code retains NVIDIA's OpenMDW-1.1
-identifier. The corresponding license, notice and attribution are under
-`fluxvla/models/third_party_models/cosmos3/`.
+identifier and is documented in
+`fluxvla/models/third_party_models/cosmos3/ATTRIBUTION.txt`.

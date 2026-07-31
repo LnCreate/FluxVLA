@@ -9,13 +9,9 @@
 from .cosmos3_attention import (SplitInfo, build_packed_sequence,
                                 two_way_attention)
 from .cosmos3_backbone import Cosmos3MoTBackbone
-from .cosmos3_edge_backbone import (Cosmos3EdgeBackbone,
-                                    Cosmos3EdgeTextDecoderLayer)
 from .cosmos3_mot_layer import Cosmos3TextDecoderLayer
 
 __all__ = [
-    'Cosmos3EdgeBackbone',
-    'Cosmos3EdgeTextDecoderLayer',
     'Cosmos3MoTBackbone',
     'Cosmos3TextDecoderLayer',
     'SplitInfo',

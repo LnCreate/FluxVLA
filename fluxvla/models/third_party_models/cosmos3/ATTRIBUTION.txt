@@ -21,13 +21,14 @@ Current subset size: 14 Python files.
 Edge adaptation
 ---------------
 
-- `fluxvla/models/backbones/vlms/cosmos3/cosmos3_edge_backbone.py` adapts the
-  public Nemotron configuration, RMSNorm, ReLU2 MLP, multimodal RoPE, and
-  56-hybrid-block to 28-MoT-layer construction from:
+- `nemotron_3_dense_vl.py` adapts the public Nemotron configuration, RMSNorm,
+  ReLU2 MLP, and multimodal RoPE from:
   - `cosmos_framework/model/vfm/vlm/nemotron_3_dense_vl/`
   - `cosmos_framework/model/vfm/mot/unified_mot.py`
-- `fluxvla/models/backbones/vlms/cosmos3/cosmos3_mot_layer.py` contains the
-  shared dual-pathway MoT layer used by both Qwen3-VL and Nemotron backbones.
+- `fluxvla/models/backbones/vlms/cosmos3/cosmos3_backbone.py` selects the
+  Qwen3-VL or Nemotron text components from the model configuration.
+- `fluxvla/models/backbones/vlms/cosmos3/cosmos3_mot_layer.py` contains their
+  shared dual-pathway MoT layer.
 
 Both files retain NVIDIA's OpenMDW-1.1 SPDX identifier.
 
