@@ -8,9 +8,10 @@ for Edge from `vlm_config.model_type`.
 
 - Native FluxVLA training and LIBERO evaluation.
 - Official `nvidia/Cosmos3-Edge` transformer checkpoint.
-- Native LIBERO 7D actions, padded internally to the checkpoint's 64D action
-  projector width with embodiment domain 5.
-- H16 joint video/action flow-matching training.
+- LIBERO frame-wise 7D actions converted to the official 10D
+  translation/rot6d/gripper representation, then padded internally to the
+  checkpoint's 64D action projector width with embodiment domain 5.
+- H16 WAM-only video/action flow-matching training.
 
 The current Edge configuration enables the Nemotron generator/policy tower. It
 does not enable the SigLIP2 reasoner visual tower or autoregressive reasoner
@@ -43,14 +44,17 @@ the PR #51 Nano/Super configs. It expects the published transformer layout:
 
 | Field | Value |
 |---|---|
-| images | two 128×128 views, stacked into a 256×128 video frame |
-| action | `[B,16,7]`, mean/std normalized and padded internally to 64D |
+| images | two 256×256 views, horizontally tiled into a 256×512 video frame |
+| action | stored as `[B,16,7]`, converted to rot6d `[B,16,10]`, quantile normalized, then padded internally to 64D |
 | embodiment | domain 5 |
 | control rate | 20 Hz |
-| objective | joint action/video flow matching, weights 10/1 |
+| objective | WAM-only joint action/video denoising, action/vision weights 10/10 |
 | inference | 30 UniPC steps, shift 10 |
 
 There is no LIBERO 7D to DROID 8D conversion.
+The Edge generation tower is loaded from the official checkpoint while the
+LIBERO action input/output projections and modality embedding are initialized
+from scratch.
 
 ## Training configs
 
@@ -63,6 +67,11 @@ The current recipes follow JiKun's Nano schedule while replacing the Qwen
 backbone and tokenizer with Edge/Nemotron. `full_finetune` is the historical
 recipe name; the model freezes the understanding pathway and trains the
 generation/action pathway (`freeze_non_moe_vlm_backbone=True`).
+
+Single-suite recipes run for 2000 optimizer steps; mixed training runs for
+5000. On eight GPUs, per-device batch 64 with 4 accumulation steps gives the
+target global batch size 2048 without reducing the configured image
+resolution.
 
 Example:
 

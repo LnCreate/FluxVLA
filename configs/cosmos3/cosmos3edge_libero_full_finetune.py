@@ -29,13 +29,13 @@ eval = dict(
                 input_sizes=[
                     [
                         3,
-                        128,
-                        128,
+                        256,
+                        256,
                     ],
                     [
                         3,
-                        128,
-                        128,
+                        256,
+                        256,
                     ],
                 ],
                 means=[
@@ -69,7 +69,7 @@ eval = dict(
                     conditioning_fps=20.0,
                     frame_window_size=17,
                     video_height=256,
-                    video_width=128),
+                    video_width=512),
                 cfg_dropout_rate=0.0,
                 max_len=512,
                 output_attention_mask_key='lang_masks',
@@ -89,13 +89,19 @@ eval = dict(
                 quat_key='robot0_eef_quat',
                 state_dim=64,
                 type='LiberoProprioFromInputs'),
-            dict(frame_window_size=1, num_views=2, type='PrepareVideo'),
+            dict(
+                frame_window_size=1,
+                num_views=2,
+                tile_direction='horizontal',
+                type='PrepareVideo'),
         ],
         type='LiberoParquetEvalDataset'),
     denormalize_action=dict(
-        action_dim=7, norm_type='mean_std', type='DenormalizeLiberoAction'),
+        action_dim=10,
+        norm_type='quantile_rot',
+        type='DenormalizeLiberoFramewiseRot6DAction'),
     enable_mixed_precision_training=True,
-    eval_chunk_size=10,
+    eval_chunk_size=16,
     inference_seed=7,
     mixed_precision_dtype='bf16',
     model_family='cosmos3',
@@ -103,7 +109,7 @@ eval = dict(
     num_inference_steps=30,
     num_steps_wait=10,
     num_trials_per_task=50,
-    resize_size=128,
+    resize_size=256,
     seed=7,
     task_ids=None,
     task_suite_name='libero_10',
@@ -174,10 +180,11 @@ inference_model = dict(
         'norm_moe_gen.weight'
     }),
     num_embodiment_domains=32,
-    ori_action_dim=7,
+    ori_action_dim=10,
     packed_attention_backend='flash2',
     position_embedding_type='unified_3d_mrope',
     pretrained_name_or_path='./checkpoints/Cosmos3-Edge/transformer',
+    reinitialize_action_policy=True,
     rectified_flow_inference_config=dict(
         num_steps=30,
         num_train_timesteps=1000,
@@ -203,7 +210,7 @@ inference_model = dict(
         use_dynamic_shift=False,
         use_high_sigma_strategy=False,
         use_high_sigma_strategy_action=False,
-        vision_loss_weight=1.0),
+        vision_loss_weight=10.0),
     special_tokens=dict(
         end_of_generation=21, eos_token_id=11, start_of_generation=20),
     strict_mapping=True,
@@ -316,10 +323,11 @@ model = dict(
         'norm_moe_gen.weight'
     }),
     num_embodiment_domains=32,
-    ori_action_dim=7,
+    ori_action_dim=10,
     packed_attention_backend='flash2',
     position_embedding_type='unified_3d_mrope',
     pretrained_name_or_path='./checkpoints/Cosmos3-Edge/transformer',
+    reinitialize_action_policy=True,
     rectified_flow_inference_config=dict(
         num_steps=30,
         num_train_timesteps=1000,
@@ -345,7 +353,7 @@ model = dict(
         use_dynamic_shift=False,
         use_high_sigma_strategy=False,
         use_high_sigma_strategy_action=False,
-        vision_loss_weight=1.0),
+        vision_loss_weight=10.0),
     special_tokens=dict(
         end_of_generation=21, eos_token_id=11, start_of_generation=20),
     strict_mapping=True,
@@ -419,18 +427,21 @@ runner = dict(
         type='Cosmos3Collator'),
     enable_gradient_checkpointing=True,
     enable_mixed_precision_training=True,
-    grad_accumulation_steps=1,
-    lr_scheduler=dict(type='linear-warmup+cosine-decay', warmup_ratio=0.0),
-    max_epochs=12,
+    grad_accumulation_steps=4,
+    lr_scheduler=dict(
+        cycle_length=16000,
+        type='linear-warmup+linear-decay',
+        warmup_steps=500),
+    max_epochs=None,
     max_grad_norm=1.0,
     max_keep_ckpts=2,
-    max_steps=None,
+    max_steps=5000,
     metric=dict(
         active_trackers=(
             'jsonl',
             'wandb',
         ),
-        grad_accumulation_steps=1,
+        grad_accumulation_steps=4,
         run_dir='work_dirs',
         type='VLAMetric',
         window_size=1),
@@ -441,18 +452,18 @@ runner = dict(
             0.99,
         ),
         eps=1e-08,
+        exclude_1d_from_weight_decay=False,
         fused=True,
-        lr=8e-05,
+        lr=5e-05,
         paramwise_learning_rate=dict({
-            'action_in_proj.': 0.0004,
-            'action_modality_embed': 0.0004,
-            'action_out_proj.': 0.0004
+            'action_in_proj.': 0.00025,
+            'action_modality_embed': 0.00025,
+            'action_out_proj.': 0.00025
         }),
         type='AdamW',
         weight_decay=0.05),
     sampler=None,
-    save_epoch_interval=1,
-    save_iter_interval=10000,
+    save_iter_interval=500,
     sharding_strategy='full-shard',
     tokenizer=dict(
         model_max_length=4096,
@@ -469,7 +480,10 @@ train_dataloader = dict(
             action_window_size=16,
             data_root_path=[
                 '/mnt/data/cpfs/mnt/data/yanis/FastWAM/data/libero_mujoco3.3.2/libero_spatial_no_noops_lerobot',
+                '/mnt/data/cpfs/mnt/data/yanis/FastWAM/data/libero_mujoco3.3.2/libero_spatial_no_noops_lerobot',
                 '/mnt/data/cpfs/mnt/data/yanis/FastWAM/data/libero_mujoco3.3.2/libero_object_no_noops_lerobot',
+                '/mnt/data/cpfs/mnt/data/yanis/FastWAM/data/libero_mujoco3.3.2/libero_object_no_noops_lerobot',
+                '/mnt/data/cpfs/mnt/data/yanis/FastWAM/data/libero_mujoco3.3.2/libero_goal_no_noops_lerobot',
                 '/mnt/data/cpfs/mnt/data/yanis/FastWAM/data/libero_mujoco3.3.2/libero_goal_no_noops_lerobot',
                 '/mnt/data/cpfs/mnt/data/yanis/FastWAM/data/libero_mujoco3.3.2/libero_10_no_noops_lerobot',
             ],
@@ -499,13 +513,14 @@ train_dataloader = dict(
                         'observation.images.image',
                         'observation.images.wrist_image',
                     ]),
+                dict(type='LiberoFramewiseActionToRot6D'),
                 dict(
                     action_metadata=dict(
                         append_viewpoint=False,
                         conditioning_fps=20.0,
                         frame_window_size=17,
                         video_height=256,
-                        video_width=128),
+                        video_width=512),
                     cfg_dropout_rate=0.1,
                     max_len=512,
                     tokenizer=dict(
@@ -515,23 +530,28 @@ train_dataloader = dict(
                         trust_remote_code=True,
                         type='PretrainedTokenizer'),
                     type='ProcessCosmos3Prompt'),
-                dict(height=128, type='ResizeImages', width=128),
+                dict(height=256, type='ResizeImages', width=256),
                 dict(type='SimpleNormalizeImages'),
                 dict(
                     action_dim=64,
                     action_key='action',
-                    norm_type='mean_std',
+                    action_norm_type='quantile',
+                    state_norm_type='none',
                     state_dim=64,
                     state_key='proprio',
                     type='NormalizeStatesAndActions'),
                 dict(
                     conditioning_fps=20.0,
                     frame_window_size=17,
-                    mode='joint',
+                    mode='wam',
                     prepend_state_to_action=False,
-                    raw_action_dim=7,
+                    raw_action_dim=10,
                     type='BuildCosmos3Sequence'),
-                dict(frame_window_size=17, num_views=2, type='PrepareVideo'),
+                dict(
+                    frame_window_size=17,
+                    num_views=2,
+                    tile_direction='horizontal',
+                    type='PrepareVideo'),
             ],
             type='ParquetDataset',
             use_delta=False,
@@ -550,6 +570,35 @@ train_dataloader = dict(
             'action',
         ],
         statistic_name='all_libero_no_noops',
+        statistics_overrides={
+            'all_libero_no_noops':
+            dict(
+                action=dict(
+                    mean=[
+                        0.050704, 0.097407, -0.094833, 0.994873, -0.004579,
+                        -0.004288, 0.004389, 0.996104, 0.001109, 0.476725
+                    ],
+                    std=[
+                        0.333621, 0.387175, 0.45714, 0.010807, 0.077802,
+                        0.063386, 0.078571, 0.009994, 0.038504, 0.49946
+                    ],
+                    min=[
+                        -0.9375, -0.9375, -0.9375, 0.902028, -0.356085,
+                        -0.367416, -0.370434, 0.921907, -0.255, 0.0
+                    ],
+                    max=[
+                        0.9375, 0.9375, 0.9375, 1.0, 0.368853, 0.341214,
+                        0.356395, 1.0, 0.348251, 1.0
+                    ],
+                    q01=[
+                        -0.723214, -0.808929, -0.9375, 0.934955, -0.223431,
+                        -0.189878, -0.334735, 0.938516, -0.107736, 0.0
+                    ],
+                    q99=[
+                        0.9375, 0.870536, 0.9375, 1.0, 0.331, 0.163153,
+                        0.226216, 1.0, 0.127158, 1.0
+                    ]))
+        },
         type='DistributedRepeatingDataset'),
-    per_device_batch_size=8,
+    per_device_batch_size=64,
     per_device_num_workers=4)

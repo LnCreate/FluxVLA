@@ -39,7 +39,7 @@ from fluxvla.models.third_party_models.cosmos3.data.vfm import sequence_packing
 
 SequencePlan = sequence_packing.SequencePlan
 _IMAGE2VIDEO_MODE = 'image2video'
-_ACTION_MODES = ('policy', 'forward_dynamics', 'inverse_dynamics')
+_ACTION_MODES = ('wam', 'forward_dynamics', 'inverse_dynamics')
 _SEQUENCE_MODES = (_IMAGE2VIDEO_MODE, *_ACTION_MODES)
 _JOINT_MODE = 'joint'
 
@@ -80,7 +80,7 @@ def build_sequence_plan_from_mode(
     condition frame indexes for vision and action based on the mode.
     """
     valid_modes = [
-        'image2video', 'forward_dynamics', 'inverse_dynamics', 'policy'
+        'image2video', 'forward_dynamics', 'inverse_dynamics', 'wam'
     ]
     if mode not in valid_modes:
         raise ValueError(f'Invalid mode: {mode!r}. Must be one of '
@@ -88,13 +88,13 @@ def build_sequence_plan_from_mode(
 
     # Determine if action should be included based on mode
     # image2video mode: no action (pure image-to-video generation)
-    # forward_dynamics, inverse_dynamics, policy: action is needed
+    # forward_dynamics, inverse_dynamics, wam: action is needed
     has_action = mode != 'image2video'
 
     # Determine condition frame indexes based on mode
-    # image2video/forward_dynamics/policy: first frame is clean (conditioning)
+    # image2video/forward_dynamics/wam: first frame is clean (conditioning)
     # inverse_dynamics: all frames are provided as context
-    if mode in ['image2video', 'forward_dynamics', 'policy']:
+    if mode in ['image2video', 'forward_dynamics', 'wam']:
         condition_frame_indexes_vision = [0]
     elif mode == 'inverse_dynamics':
         # All frames are observed for inverse dynamics
@@ -105,7 +105,7 @@ def build_sequence_plan_from_mode(
 
     # For action conditioning indexes:
     # forward_dynamics: all action steps are clean (conditioning)
-    # inverse_dynamics/policy: action is supervised (predicted)
+    # inverse_dynamics/wam: action is supervised (predicted)
     # History frames (prepended) are always conditioning.
     base_action_length = action_length - num_history_actions
     if mode == 'forward_dynamics':
@@ -379,7 +379,7 @@ class BuildCosmos3Sequence:
 
     def __init__(
         self,
-        mode: str = 'policy',
+        mode: str = 'wam',
         frame_window_size: int = 5,
         video_temporal_downsample: int = 4,
         conditioning_fps: float = 15.0,
