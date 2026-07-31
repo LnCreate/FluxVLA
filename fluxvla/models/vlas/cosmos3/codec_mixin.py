@@ -227,13 +227,12 @@ class Cosmos3CodecMixin:
             action.token_shapes,
             action.domain_id,
         )
-        action_modality_embed = self.action_modality_embed()
         packed_tokens_action = self.action_in_proj(
-            packed_tokens_action.to(dtype=action_modality_embed.dtype),
+            packed_tokens_action.to(dtype=self.action_modality_embed.dtype),
             per_token_embodiment_id,
         )
-        packed_tokens_action = packed_tokens_action + \
-            action_modality_embed.view(1, -1)
+        packed_tokens_action = packed_tokens_action + self.action_modality_embed.view(
+            1, -1)
         packed_tokens_action = packed_tokens_action.to(target_dtype)
 
         if action.mse_loss_indexes.numel() > 0:

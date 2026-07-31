@@ -16,7 +16,7 @@ keeps only the files needed by:
 - `fluxvla.transforms.transform_cosmos3`
 - `scripts/cosmos3_fluxvla_infer.py`
 
-Current subset size: 14 Python files.
+Current subset size: 15 Python files.
 
 Edge adaptation
 ---------------

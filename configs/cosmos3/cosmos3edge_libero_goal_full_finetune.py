@@ -150,7 +150,7 @@ inference_model = dict(
         '.self_attn.add_v_proj.',
         'action_in_proj.':
         'action_proj_in.',
-        'action_modality_embed.weight':
+        'action_modality_embed':
         'action_modality_embed',
         'action_out_proj.':
         'action_proj_out.',
@@ -292,7 +292,7 @@ model = dict(
         '.self_attn.add_v_proj.',
         'action_in_proj.':
         'action_proj_in.',
-        'action_modality_embed.weight':
+        'action_modality_embed':
         'action_modality_embed',
         'action_out_proj.':
         'action_proj_out.',

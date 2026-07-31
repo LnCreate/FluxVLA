@@ -23,7 +23,6 @@ from fluxvla.models.third_party_models.cosmos3.model.vfm.mot import \
     modeling_utils
 from fluxvla.tokenizers.cosmos3_wan22_vae import Cosmos3Wan22VAE
 from .base_vla import BaseVLA
-from .cosmos3.action_embedding import ActionModalityEmbedding
 from .cosmos3.codec_mixin import Cosmos3CodecMixin
 from .cosmos3.components_mixin import Cosmos3ComponentsMixin
 from .cosmos3.flow_utils import (_as_action_list, _as_long_list, _as_text_ids,
@@ -193,7 +192,7 @@ class Cosmos3FlowMatching(Cosmos3ComponentsMixin, Cosmos3ScheduleMixin,
                 num_domains=num_embodiment_domains,
             ),
         )
-        self.action_modality_embed = ActionModalityEmbedding(hidden_size)
+        self.action_modality_embed = nn.Parameter(torch.zeros(hidden_size))
         self._validate_projector_shapes()
         self._init_projection_weights_like_cosmos3()
 

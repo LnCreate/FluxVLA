@@ -52,12 +52,7 @@ class SetCosmos3ActionMetadata:
         self,
         conditioning_fps: Optional[float] = None,
         prepend_state_to_action: Optional[bool] = None,
-        model_path: Optional[str] = None,
     ) -> None:
-        # PrivateInferenceDataset injects model_path into every transform.
-        # This metadata-only transform has no files to load, but accepts the
-        # argument so it can be used in that shared pipeline.
-        del model_path
         self.conditioning_fps = conditioning_fps
         self.prepend_state_to_action = prepend_state_to_action
 

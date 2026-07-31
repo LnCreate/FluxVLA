@@ -39,24 +39,8 @@ class _FlowRequest:
 
 class Cosmos3InferenceMixin:
 
-    def _sampling_config(
-        self,
-        *,
-        num_inference_steps: Optional[int] = None,
-        shift: Optional[float] = None,
-    ) -> Dict:
+    def _sampling_config(self) -> Dict:
         sampling_config = dict(self.rectified_flow_inference_config)
-        if num_inference_steps is not None:
-            num_inference_steps = int(num_inference_steps)
-            if num_inference_steps < 1:
-                raise ValueError('num_inference_steps must be positive, got '
-                                 f'{num_inference_steps}.')
-            sampling_config['num_steps'] = num_inference_steps
-        if shift is not None:
-            shift = float(shift)
-            if shift <= 0:
-                raise ValueError(f'shift must be positive, got {shift}.')
-            sampling_config['shift'] = shift
         sampling_config['scheduler_type'] = str(
             sampling_config['scheduler_type']).lower()
         if sampling_config['scheduler_type'] != 'unipc':
@@ -141,9 +125,9 @@ class Cosmos3InferenceMixin:
         if actions.dim() != 3:
             raise ValueError('Cosmos3 actions must have shape [B,T,D], '
                              f'got {tuple(actions.shape)}.')
-        if actions.shape[-1] > self.max_action_dim:
-            raise ValueError(f'Cosmos3 expected padded action dim <= '
-                             f'{self.max_action_dim}, got '
+        if actions.shape[-1] > raw_action_dim_value:
+            raise ValueError(f'Cosmos3 expected action dim <= '
+                             f'{raw_action_dim_value}, got '
                              f'{actions.shape[-1]}.')
         actions = actions.to(device=device, dtype=dtype).clone()
         if actions.shape[-1] < self.max_action_dim:
@@ -153,11 +137,6 @@ class Cosmos3InferenceMixin:
                 self.max_action_dim - actions.shape[-1],
             )
             actions = torch.cat([actions, padding], dim=-1)
-        # State/action transforms commonly pad to max_action_dim before
-        # inference. Only the embodiment's raw dimensions are meaningful;
-        # keeping padded state values here would condition nonexistent action
-        # joints when prepend_state_to_action=True.
-        actions[..., raw_action_dim_value:] = 0
         return actions
 
     @staticmethod
@@ -383,8 +362,6 @@ class Cosmos3InferenceMixin:
         initial_latents: Optional[torch.Tensor] = None,
         seed: Optional[int | List[int]] = None,
         guidance: float = 1.0,
-        shift: Optional[float] = None,
-        num_inference_steps: Optional[int] = None,
         conditioning_fps: Optional[float | torch.Tensor] = None,
         action_fps: Optional[float | torch.Tensor] = None,
     ) -> _FlowRequest:
@@ -494,11 +471,8 @@ class Cosmos3InferenceMixin:
         return _FlowRequest(
             batch_size=batch_size,
             device=device,
-            sampling_config=self._sampling_config(
-                num_inference_steps=num_inference_steps,
-                shift=shift,
-            ),
-            guidance=float(guidance),
+            sampling_config=self._sampling_config(),
+            guidance=guidance,
             text_ids=text_ids,
             negative_text_ids=negative_text_ids,
             sequence_plan=sequence_plan,
@@ -817,8 +791,6 @@ class Cosmos3InferenceMixin:
         *,
         images: torch.Tensor,
         text_token_ids: Optional[torch.Tensor | List[List[int]]] = None,
-        negative_text_token_ids: Optional[torch.Tensor
-                                          | List[List[int]]] = None,
         embodiment_id: Optional[int] = None,
         raw_action_dim: Optional[int] = None,
         sequence_plan: SequencePlan,
@@ -833,7 +805,6 @@ class Cosmos3InferenceMixin:
         flow = self._prepare_flow_request(
             images=images,
             text_token_ids=text_token_ids,
-            negative_text_token_ids=negative_text_token_ids,
             embodiment_id=embodiment_id,
             raw_action_dim=action_dim,
             sequence_plan=sequence_plan,
@@ -1001,17 +972,11 @@ class Cosmos3InferenceMixin:
         images: torch.Tensor,
         lang_tokens: torch.Tensor,
         sequence_plan: SequencePlan,
-        negative_text_token_ids: Optional[torch.Tensor
-                                          | List[List[int]]] = None,
         states: Optional[torch.Tensor] = None,
         embodiment_id: Optional[int | torch.Tensor] = None,
         raw_action_dim: Optional[int | torch.Tensor] = None,
         conditioning_fps: Optional[float | torch.Tensor] = None,
         prepend_state_to_action: bool | torch.Tensor = False,
-        seed: Optional[int | List[int]] = None,
-        guidance: float = 1.0,
-        shift: Optional[float] = None,
-        num_inference_steps: Optional[int] = None,
         **kwargs,
     ) -> Dict[str, torch.Tensor | List[torch.Tensor]]:
         del kwargs
@@ -1031,17 +996,12 @@ class Cosmos3InferenceMixin:
         flow = self._prepare_flow_request(
             images=images,
             text_token_ids=lang_tokens,
-            negative_text_token_ids=negative_text_token_ids,
             actions=actions,
             embodiment_id=embodiment_id,
             raw_action_dim=raw_action_dim,
             sequence_plan=sequence_plan,
             num_frames=self._policy_num_vision_latents(future_horizon),
             action_horizon=future_horizon + int(prepend_state_to_action),
-            seed=seed,
-            guidance=guidance,
-            shift=shift,
-            num_inference_steps=num_inference_steps,
             conditioning_fps=conditioning_fps,
             action_fps=conditioning_fps,
         )
@@ -1052,40 +1012,24 @@ class Cosmos3InferenceMixin:
         self,
         images: torch.Tensor,
         lang_tokens: torch.Tensor,
-        negative_text_token_ids: Optional[torch.Tensor
-                                          | List[List[int]]] = None,
         states: Optional[torch.Tensor] = None,
         embodiment_ids: Optional[torch.Tensor] = None,
         raw_action_dim: Optional[int | torch.Tensor] = None,
         conditioning_fps: Optional[torch.Tensor] = None,
         prepend_state_to_action: bool | torch.Tensor = False,
         decode_video: bool = False,
-        seed: Optional[int | List[int]] = None,
-        guidance: float = 1.0,
-        shift: Optional[float] = None,
-        num_inference_steps: Optional[int] = None,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | List[torch.Tensor]]:
-        batch_size = self._text_batch_size(lang_tokens)
-        if batch_size != 1:
-            raise ValueError(
-                'Cosmos3 predict_action currently supports batch size 1, '
-                f'got {batch_size}.')
         sequence_plan = self._policy_sequence_plan(prepend_state_to_action)
         result = self._predict_action_joint(
             images=images,
             lang_tokens=lang_tokens,
-            negative_text_token_ids=negative_text_token_ids,
             states=states,
             embodiment_id=embodiment_ids,
             raw_action_dim=raw_action_dim,
             conditioning_fps=conditioning_fps,
             prepend_state_to_action=prepend_state_to_action,
             sequence_plan=sequence_plan,
-            seed=seed,
-            guidance=guidance,
-            shift=shift,
-            num_inference_steps=num_inference_steps,
             **kwargs,
         )
         action_dim = int(

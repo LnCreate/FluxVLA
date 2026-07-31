@@ -95,11 +95,7 @@ class Cosmos3ComponentsMixin:
             self._init_domain_aware_like_cosmos3(projector)
         std = 1.0 / math.sqrt(self.hidden_size)
         nn.init.trunc_normal_(
-            self.action_modality_embed.weight,
-            std=std,
-            a=-3 * std,
-            b=3 * std,
-        )
+            self.action_modality_embed, std=std, a=-3 * std, b=3 * std)
 
     @staticmethod
     def _projector_dim(module: nn.Module, kind: str) -> Optional[int]:

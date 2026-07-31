@@ -107,9 +107,9 @@ def parse_args() -> argparse.Namespace:
         default=str(DEFAULT_CHECKPOINT.relative_to(PROJECT_ROOT)),
         help='Cosmos3 checkpoint root.')
     add('--model-size',
-        choices=('auto', 'edge', 'nano', 'super'),
+        choices=('auto', 'nano', 'super'),
         default='auto',
-        help='Model architecture; auto recognizes Edge/Nano/Super names.')
+        help='Model config size.')
     add('--vae-path', default=None, help='Wan2.2 VAE checkpoint.')
     add('--device', default='cuda:0', help='Torch device.')
     add('--dtype',
@@ -650,7 +650,6 @@ def save_action_json(actions: torch.Tensor, output_path: Path) -> Path:
 
 def default_config_path(model_size: str) -> Path:
     relative = {
-        'edge': 'configs/cosmos3/cosmos3edge_libero_full_finetune.py',
         'nano': 'configs/cosmos3/cosmos3nano_libero_10_full_finetune.py',
         'super': 'configs/cosmos3/cosmos3super_libero_10_full_finetune.py',
     }[model_size]
@@ -660,13 +659,7 @@ def default_config_path(model_size: str) -> Path:
 def resolve_model_size(checkpoint: str, requested: str) -> str:
     if requested != 'auto':
         return requested
-    checkpoint_name = str(checkpoint).lower()
-    if 'edge' in checkpoint_name:
-        return 'edge'
-    elif 'super' in checkpoint_name:
-        return 'super'
-    else:
-        return 'nano'
+    return 'super' if 'super' in Path(checkpoint).name.lower() else 'nano'
 
 
 def checkpoint_root_path(checkpoint: str | Path) -> Path:
@@ -716,19 +709,11 @@ def build_and_load_fluxvla_model(*,
     cfg = Config.fromfile(str(default_config_path(model_size)))
     model_kwargs = to_plain(cfg.model)
     model_kwargs.pop('type', None)
-    if model_size == 'edge':
-        if include_visual:
-            raise NotImplementedError(
-                'FluxVLA Edge support currently covers the Nemotron '
-                'generator tower; Edge visual reasoner inference is not yet '
-                'implemented.')
-    elif model_size not in {'nano', 'super'}:
-        raise ValueError(f'Unsupported Cosmos3 model size: {model_size!r}.')
     model_kwargs['pretrained_name_or_path'] = str(transformer_path)
     vlm_backbone_cfg = model_kwargs.get('vlm_backbone')
     if isinstance(vlm_backbone_cfg, dict):
         vlm_backbone_cfg['include_visual'] = bool(include_visual)
-        if model_size in {'nano', 'super'} and vision_encoder_path.is_dir():
+        if vision_encoder_path.is_dir():
             vlm_backbone_cfg['vision_encoder_path'] = str(vision_encoder_path)
     elif include_visual:
         raise ValueError('Reasoning image inputs require a configurable '

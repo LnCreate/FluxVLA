@@ -438,10 +438,8 @@ class NormalizeStatesAndActions:
     def _normalize(self, x, stats: Dict, norm_mask: List[bool] = None):
         if norm_mask is None:
             norm_mask = [True] * x.shape[-1]
-        mean = np.asarray(stats['mean'], dtype=x.dtype)
-        std = np.asarray(stats['std'], dtype=x.dtype)
-        return np.where(norm_mask, (x - mean) / (std + 1e-6), x).astype(
-            x.dtype, copy=False)
+        return np.where(norm_mask, (x - np.array(stats['mean'])) /
+                        (np.array(stats['std']) + 1e-6), x)
 
     def _normalize_quantile(self,
                             x,
