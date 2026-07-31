@@ -29,7 +29,6 @@ _config = _build(
     max_steps=1,
     eval_trials=50,
     data_root_path=_data_roots,
-    action_init='checkpoint',
 )
 
 for _model_key in ('model', 'inference_model'):
@@ -47,10 +46,6 @@ _wrapper = _train['dataset']
 _wrapper['statistic_name'] = _statistic_name
 _dataset = _wrapper['datasets']
 _dataset['statistic_name'] = _statistic_name
-# JiKun's loader counted all 277,713 rows in each epoch and resampled invalid
-# episode-tail starts.  Keep that epoch/sample budget while the hardened
-# loader deterministically repeats only prevalidated full-window starts.
-_dataset['repeat_to_full_length'] = True
 
 for _index, _transform in enumerate(_dataset['transforms']):
     if _transform['type'] == 'ProcessCosmos3Prompt':

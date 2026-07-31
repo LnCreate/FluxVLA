@@ -3,7 +3,7 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
-"""PEFT-compatible action modality embedding."""
+"""Checkpoint-compatible action modality embedding."""
 
 from __future__ import annotations
 
@@ -12,7 +12,10 @@ import torch.nn as nn
 
 
 class ActionModalityEmbedding(nn.Module):
-    """One-token module so PEFT can train, save, and reload the embedding."""
+    """Expose the embedding as ``action_modality_embed.weight``.
+
+    Existing FluxVLA Edge fine-tuning checkpoints use this state-dict key.
+    """
 
     def __init__(self, hidden_size: int) -> None:
         super().__init__()

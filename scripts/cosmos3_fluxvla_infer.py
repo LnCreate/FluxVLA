@@ -149,10 +149,6 @@ def parse_args() -> argparse.Namespace:
     add('--load-only',
         action='store_true',
         help='Load checkpoints and exit before sampling.')
-    add('--dump-first-velocity',
-        default=None,
-        help='Save the first conditional transformer velocity/input bundle '
-        'as NPZ for cross-environment parity comparison.')
     add('--readme-repro',
         action='store_true',
         help='Run Cosmos3-Nano README examples.')
@@ -654,9 +650,7 @@ def save_action_json(actions: torch.Tensor, output_path: Path) -> Path:
 
 def default_config_path(model_size: str) -> Path:
     relative = {
-        # Edge reuses the common modality/action settings, then replaces the
-        # Qwen backbone and every hidden-size-dependent projector below.
-        'edge': 'configs/cosmos3/cosmos3edge_libero_task_smoke.py',
+        'edge': 'configs/cosmos3/cosmos3edge_libero_full_finetune.py',
         'nano': 'configs/cosmos3/cosmos3nano_libero_10_full_finetune.py',
         'super': 'configs/cosmos3/cosmos3super_libero_10_full_finetune.py',
     }[model_size]
@@ -669,43 +663,10 @@ def resolve_model_size(checkpoint: str, requested: str) -> str:
     checkpoint_name = str(checkpoint).lower()
     if 'edge' in checkpoint_name:
         return 'edge'
-    return 'super' if 'super' in checkpoint_name else 'nano'
-
-
-def _apply_edge_model_config(model_kwargs: dict[str, Any]) -> None:
-    from fluxvla.models.backbones.vlms.cosmos3.cosmos3_edge_backbone import (
-        COSMOS3_EDGE_SPECIAL_TOKENS, COSMOS3_EDGE_TEXT_CONFIG)
-
-    hidden_size = int(COSMOS3_EDGE_TEXT_CONFIG['hidden_size'])
-    model_kwargs['vlm_backbone'] = dict(
-        type='Cosmos3EdgeBackbone',
-        vlm_config=dict(COSMOS3_EDGE_TEXT_CONFIG),
-        include_visual=False,
-        skip_init_weights=True,
-    )
-    model_kwargs['vision_in_proj'] = dict(
-        type='LinearProjector',
-        in_dim=48 * 2 * 2,
-        out_dim=hidden_size,
-    )
-    model_kwargs['vision_out_proj'] = dict(
-        type='LinearProjector',
-        in_dim=hidden_size,
-        out_dim=48 * 2 * 2,
-    )
-    model_kwargs['action_in_proj'] = dict(
-        type='DomainAwareLinear',
-        input_size=int(model_kwargs.get('max_action_dim', 64)),
-        output_size=hidden_size,
-        num_domains=int(model_kwargs.get('num_embodiment_domains', 32)),
-    )
-    model_kwargs['action_out_proj'] = dict(
-        type='DomainAwareLinear',
-        input_size=hidden_size,
-        output_size=int(model_kwargs.get('max_action_dim', 64)),
-        num_domains=int(model_kwargs.get('num_embodiment_domains', 32)),
-    )
-    model_kwargs['special_tokens'] = dict(COSMOS3_EDGE_SPECIAL_TOKENS)
+    elif 'super' in checkpoint_name:
+        return 'super'
+    else:
+        return 'nano'
 
 
 def checkpoint_root_path(checkpoint: str | Path) -> Path:
@@ -761,18 +722,13 @@ def build_and_load_fluxvla_model(*,
                 'FluxVLA Edge support currently covers the Nemotron '
                 'generator tower; Edge visual reasoner inference is not yet '
                 'implemented.')
-        from fluxvla.models.vlas.cosmos3.checkpoint_mixin import \
-            infer_cosmos3_action_layout
-        max_action_dim, num_domains = infer_cosmos3_action_layout(
-            transformer_path)
-        model_kwargs['max_action_dim'] = max_action_dim
-        model_kwargs['num_embodiment_domains'] = num_domains
-        _apply_edge_model_config(model_kwargs)
+    elif model_size not in {'nano', 'super'}:
+        raise ValueError(f'Unsupported Cosmos3 model size: {model_size!r}.')
     model_kwargs['pretrained_name_or_path'] = str(transformer_path)
     vlm_backbone_cfg = model_kwargs.get('vlm_backbone')
     if isinstance(vlm_backbone_cfg, dict):
         vlm_backbone_cfg['include_visual'] = bool(include_visual)
-        if model_size != 'edge' and vision_encoder_path.is_dir():
+        if model_size in {'nano', 'super'} and vision_encoder_path.is_dir():
             vlm_backbone_cfg['vision_encoder_path'] = str(vision_encoder_path)
     elif include_visual:
         raise ValueError('Reasoning image inputs require a configurable '
@@ -946,7 +902,6 @@ class Cosmos3InferApp:
         self.model = None
         self.tokenizer = None
         self.processor = None
-        self._velocity_dumped = False
 
     # App lifecycle.
     def run(self) -> None:
@@ -962,11 +917,6 @@ class Cosmos3InferApp:
             report['name'] = sample['name']
             manifest['samples'].append(report)
             print(json.dumps(report, indent=2))
-
-        if self.args.dump_first_velocity and not self._velocity_dumped:
-            raise RuntimeError(
-                '--dump-first-velocity was requested but no flow velocity '
-                'was evaluated.')
 
         manifest_path = self.output_dir / 'fluxvla_manifest.json'
         manifest_path.write_text(json.dumps(manifest, indent=2) + '\n')
@@ -988,67 +938,6 @@ class Cosmos3InferApp:
             device=torch.device(self.args.device),
             action_horizon=self._max_action_horizon(),
             include_visual=self._needs_reasoner)
-        if self.args.dump_first_velocity:
-            self._install_velocity_dump()
-
-    def _install_velocity_dump(self) -> None:
-        """Capture the first conditional velocity and its exact model inputs."""
-        output_path = resolve_under_root(self.args.dump_first_velocity)
-        original = self.model._predict_flow_velocity
-
-        def as_numpy(value):
-            if value is None:
-                return None
-            if not isinstance(value, torch.Tensor):
-                value = torch.as_tensor(value)
-            return value.detach().to(device='cpu', dtype=torch.float32).numpy()
-
-        def capture(flow, vision_latents, action_tokens, token_ids, timestep):
-            velocities = original(flow, vision_latents, action_tokens,
-                                  token_ids, timestep)
-            if not self._velocity_dumped:
-                payload = {
-                    f'velocity_{name}': as_numpy(value)
-                    for name, value in velocities.items()
-                }
-                if vision_latents is not None:
-                    payload['input_vision'] = as_numpy(vision_latents)
-                if action_tokens is not None:
-                    payload['input_action'] = as_numpy(action_tokens)
-                payload['text_token_ids'] = np.asarray(
-                    token_ids, dtype=np.int64)
-                payload['timestep'] = as_numpy(timestep)
-                payload['embodiment_id'] = np.asarray(
-                    -1 if flow.embodiment_id_value is None else
-                    flow.embodiment_id_value, dtype=np.int64)
-                payload['raw_action_dim'] = np.asarray(
-                    -1 if flow.raw_action_dim_value is None else
-                    flow.raw_action_dim_value, dtype=np.int64)
-                if flow.conditioning_fps is not None:
-                    payload['conditioning_fps'] = as_numpy(
-                        flow.conditioning_fps)
-                if flow.action_fps is not None:
-                    payload['action_fps'] = as_numpy(flow.action_fps)
-                plan = flow.sequence_plan
-                payload['sequence_has_text'] = np.asarray(
-                    plan.has_text, dtype=np.bool_)
-                payload['sequence_has_vision'] = np.asarray(
-                    plan.has_vision, dtype=np.bool_)
-                payload['sequence_has_action'] = np.asarray(
-                    plan.has_action, dtype=np.bool_)
-                payload['sequence_condition_vision'] = np.asarray(
-                    plan.condition_frame_indexes_vision, dtype=np.int64)
-                payload['sequence_condition_action'] = np.asarray(
-                    plan.condition_frame_indexes_action, dtype=np.int64)
-                payload['sequence_action_start_offset'] = np.asarray(
-                    plan.action_start_frame_offset, dtype=np.int64)
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                np.savez(output_path, **payload)
-                self._velocity_dumped = True
-                print(f'wrote parity velocity bundle {output_path}')
-            return velocities
-
-        self.model._predict_flow_velocity = capture
 
     @property
     def _needs_reasoner(self) -> bool:
@@ -1414,13 +1303,9 @@ class Cosmos3InferApp:
     def _run_policy_action(self, sample: dict[str, Any], sample_dir: Path,
                            ctx: ActionContext) -> dict[str, Any]:
         latent_frames = self._action_latent_frames(ctx)
-        negative_ids = _text_ids(self.tokenizer,
-                                 _negative_prompt(sample, self.args),
-                                 self.model.device)
         result = self.model.generate_joint(
             images=ctx.video,
             text_token_ids=ctx.text_ids,
-            negative_text_token_ids=negative_ids,
             embodiment_id=ctx.embodiment_id,
             raw_action_dim=ctx.raw_action_dim,
             sequence_plan=_sequence_plan(
@@ -1432,7 +1317,6 @@ class Cosmos3InferApp:
             num_frames=latent_frames,
             action_horizon=ctx.action_chunk_size,
             seed=_sample_seed(sample, self.args),
-            guidance=float(_sampling_value(sample, self.args, 'guidance')),
             conditioning_fps=ctx.conditioning_fps,
         )
         action_path = save_action_json(result['actions'][0],
@@ -1452,13 +1336,9 @@ class Cosmos3InferApp:
     def _run_inverse_dynamics(self, sample: dict[str, Any], sample_dir: Path,
                               ctx: ActionContext) -> dict[str, Any]:
         latent_frames = self._action_latent_frames(ctx)
-        negative_ids = _text_ids(self.tokenizer,
-                                 _negative_prompt(sample, self.args),
-                                 self.model.device)
         result = self.model.generate_inverse_dynamics(
             images=ctx.video,
             text_token_ids=ctx.text_ids,
-            negative_text_token_ids=negative_ids,
             embodiment_id=ctx.embodiment_id,
             raw_action_dim=ctx.raw_action_dim,
             sequence_plan=_sequence_plan(
@@ -1470,7 +1350,6 @@ class Cosmos3InferApp:
             num_frames=latent_frames,
             action_horizon=ctx.action_chunk_size,
             seed=_sample_seed(sample, self.args),
-            guidance=float(_sampling_value(sample, self.args, 'guidance')),
             conditioning_fps=ctx.conditioning_fps,
             action_fps=ctx.conditioning_fps,
         )

@@ -19,8 +19,6 @@ from fluxvla.engines.utils import build_vla_from_cfg
 from fluxvla.engines.utils.overwatch import initialize_overwatch
 from ..utils.root import RUNNERS
 from .base_train_runner import BaseTrainRunner
-from .peft_checkpoint import (get_peft_training_state,
-                              load_peft_training_state)
 
 overwatch = initialize_overwatch(__name__)
 
@@ -47,26 +45,6 @@ def _collect_output_embedding_ids(model: torch.nn.Module) -> set:
 def _resolve_lora_target_modules(model: torch.nn.Module, target_modules):
     if not (isinstance(target_modules, str)
             and target_modules.lower() == _ALL_LINEAR_TARGET):
-        targets = ([target_modules]
-                   if isinstance(target_modules, str) else list(
-                       target_modules or ()))
-        if not targets:
-            raise ValueError('LoRA target_modules must not be empty.')
-        module_names = tuple(name for name, _ in model.named_modules())
-        missing = []
-        counts = {}
-        for target in targets:
-            matches = [
-                name for name in module_names
-                if name == target or name.endswith('.' + target)
-            ]
-            counts[target] = len(matches)
-            if not matches:
-                missing.append(target)
-        if missing:
-            raise ValueError(
-                'LoRA target module(s) matched no model modules: '
-                f'{missing}. Match counts: {counts}')
         return target_modules
 
     output_embedding_ids = _collect_output_embedding_ids(model)
@@ -185,16 +163,12 @@ class DDPTrainRunner(BaseTrainRunner):
         if overwatch.is_rank_zero():
             overwatch.info('Loading DDP model state')
 
-        target = self.vla.module if isinstance(self.vla, DDP) else self.vla
-        is_lora = bool(
-            getattr(getattr(self.cfg, 'model', None), 'use_lora', False))
-        if is_lora:
-            if not isinstance(target, PeftModel):
-                raise TypeError(
-                    'LoRA resume requires a PEFT-wrapped training model.')
-            load_peft_training_state(target, checkpoint_model_state)
+        # Load model state dict (DDP-specific)
+        if isinstance(self.vla, DDP):
+            self.vla.module.load_state_dict(
+                checkpoint_model_state, strict=False)
         else:
-            target.load_state_dict(checkpoint_model_state, strict=False)
+            self.vla.load_state_dict(checkpoint_model_state, strict=False)
 
         if overwatch.is_rank_zero():
             overwatch.info('DDP model state restored from checkpoint')
@@ -355,8 +329,6 @@ class DDPTrainRunner(BaseTrainRunner):
                 # First, save the current LoRA adapter to save_dir
                 # This is necessary before loading it with
                 # PeftModel.from_pretrained
-                peft_training_state = get_peft_training_state(
-                    self.vla.module)
                 self.vla.module.save_pretrained(save_dir)
 
                 base_vla = build_vla_from_cfg(self.cfg.model)
@@ -389,17 +361,11 @@ class DDPTrainRunner(BaseTrainRunner):
                 'global_step': global_step,
                 'epoch': epoch,
             }
-            if hasattr(self.cfg.model, 'use_lora') and self.cfg.model.use_lora:
-                checkpoint_dict['peft_model'] = peft_training_state
-                checkpoint_dict['checkpoint_model_format'] = (
-                    'peft_training_v1+merged_deployment_v1')
 
             # Save optimizer state with parameter name mapping
             # Fix: Directly save state_index -> param_name mapping dictionary
             if self.optimizer is not None:
                 optimizer_state = self.optimizer.state_dict()
-                checkpoint_dict['optimizer_param_group_topology'] = (
-                    self._optimizer_param_group_topology())
                 optimizer_state_dict_actual = optimizer_state.get('state', {})
 
                 # Get optimizer parameters in order
@@ -447,8 +413,8 @@ class DDPTrainRunner(BaseTrainRunner):
 
             # Save scheduler state
             if self.lr_scheduler is not None:
-                checkpoint_dict['scheduler_state_dict'] = (
-                    self._scheduler_state_for_checkpoint())
+                checkpoint_dict[
+                    'scheduler_state_dict'] = self.lr_scheduler.state_dict()
 
             torch.save(checkpoint_dict, checkpoint_path)
             overwatch.info(f'Saved Checkpoint at: {checkpoint_path}')
@@ -758,14 +724,7 @@ class DDPTrainRunner(BaseTrainRunner):
                 f'Resuming training from checkpoint: {self.resume_from}')
         checkpoint_info = torch.load(self.resume_from)
 
-        if bool(getattr(self.cfg.model, 'use_lora', False)):
-            if 'peft_model' not in checkpoint_info:
-                raise ValueError(
-                    'This LoRA checkpoint predates PEFT resume-state '
-                    'support and cannot be resumed safely. Use it only for '
-                    'merged deployment or restart LoRA training.')
-            self._load_model_state(checkpoint_info['peft_model'])
-        elif 'model' in checkpoint_info:
+        if 'model' in checkpoint_info:
             self._load_model_state(checkpoint_info['model'])
 
         # Restore training state (reuse base class logic)
@@ -774,7 +733,52 @@ class DDPTrainRunner(BaseTrainRunner):
         if 'epoch' in checkpoint_info:
             self.current_epoch = checkpoint_info['epoch']
 
-        self._restore_optimizer_and_scheduler(checkpoint_info)
+        # Restore optimizer state with parameter mapping support
+        # Store checkpoint info for _load_optimizer_state to access
+        if ('optimizer_state_dict' in checkpoint_info
+                and self.optimizer is not None):
+            checkpoint_optimizer_state = checkpoint_info[
+                'optimizer_state_dict']
+            # Store additional mapping info as instance variables for
+            # _load_optimizer_state
+            self._checkpoint_state_index_to_name = checkpoint_info.get(
+                'optimizer_state_index_to_name', None)
+            self._checkpoint_param_name_list = checkpoint_info.get(
+                'optimizer_param_name_list', None)
+
+            try:
+                success = self._load_optimizer_state(
+                    checkpoint_optimizer_state)
+                if not success:
+                    if overwatch.is_rank_zero():
+                        overwatch.warning(
+                            'Failed to load optimizer state. '
+                            'Training will continue with fresh optimizer '
+                            'state.')
+            except Exception as e:
+                if overwatch.is_rank_zero():
+                    overwatch.warning(
+                        f'Error loading optimizer state: {e}. '
+                        f'Training will continue with fresh optimizer '
+                        f'state.')
+            finally:
+                # Clean up temporary instance variables
+                self._checkpoint_state_index_to_name = None
+                self._checkpoint_param_name_list = None
+                # Ensure all ranks synchronize even if loading failed
+                dist.barrier()
+
+        # Restore scheduler state (reuse base class logic)
+        if ('scheduler_state_dict' in checkpoint_info
+                and self.lr_scheduler is not None):
+            try:
+                self.lr_scheduler.load_state_dict(
+                    checkpoint_info['scheduler_state_dict'])
+                if overwatch.is_rank_zero():
+                    overwatch.info('Scheduler state restored from checkpoint')
+            except Exception as e:
+                if overwatch.is_rank_zero():
+                    overwatch.warning(f'Failed to load scheduler state: {e}')
 
         if overwatch.is_rank_zero():
             overwatch.info(
@@ -804,15 +808,7 @@ class DDPTrainRunner(BaseTrainRunner):
             checkpoint_path, map_location='cuda:' + str(self.device_id))
 
         # Load model state dict (DDP-specific)
-        if bool(getattr(self.cfg.model, 'use_lora', False)):
-            if 'peft_model' not in checkpoint:
-                raise ValueError(
-                    'LoRA checkpoint has no PEFT training state and cannot '
-                    'be loaded into a training runner safely.')
-            self._load_model_state(checkpoint['peft_model'])
-            if overwatch.is_rank_zero():
-                overwatch.info('PEFT training state loaded')
-        elif 'model' in checkpoint:
+        if 'model' in checkpoint:
             if isinstance(self.vla, DDP):
                 self.vla.module.load_state_dict(
                     checkpoint['model'], strict=False)
@@ -827,9 +823,37 @@ class DDPTrainRunner(BaseTrainRunner):
             'epoch': checkpoint.get('epoch', 0),
         }
 
-        self._restore_optimizer_and_scheduler(checkpoint)
-        result['optimizer_state_dict'] = checkpoint['optimizer_state_dict']
-        result['scheduler_state_dict'] = checkpoint.get('scheduler_state_dict')
+        # Load optimizer state with parameter mapping support
+        if ('optimizer_state_dict' in checkpoint
+                and self.optimizer is not None):
+            checkpoint_optimizer_state = checkpoint['optimizer_state_dict']
+            # Store mapping info as instance variables for
+            # _load_optimizer_state
+            self._checkpoint_state_index_to_name = checkpoint.get(
+                'optimizer_state_index_to_name', None)
+            self._checkpoint_param_name_list = checkpoint.get(
+                'optimizer_param_name_list', None)
+
+            try:
+                success = self._load_optimizer_state(
+                    checkpoint_optimizer_state)
+                if not success:
+                    if overwatch.is_rank_zero():
+                        overwatch.warning(
+                            'Failed to load optimizer state. '
+                            'Training will continue with fresh optimizer '
+                            'state.')
+            finally:
+                # Clean up temporary instance variables
+                self._checkpoint_state_index_to_name = None
+                self._checkpoint_param_name_list = None
+
+            result['optimizer_state_dict'] = checkpoint_optimizer_state
+
+        # Load scheduler state (reuse base class logic)
+        if 'scheduler_state_dict' in checkpoint:
+            result['scheduler_state_dict'] = checkpoint.get(
+                'scheduler_state_dict')
 
         dist.barrier()
         return result

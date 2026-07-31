@@ -178,38 +178,6 @@ class LinearWarmupCosineDecayLRScheduler(BaseLRSchedulerPolicy):
         return scheduler
 
 
-@LR_SCHEDULERS.register_module(name=[
-    'linear-warmup+cosine-cycle',
-    'LinearWarmupCosineCycleLRScheduler',
-])
-class LinearWarmupCosineCycleLRScheduler(BaseLRSchedulerPolicy):
-    """Cosine schedule whose cycle may extend beyond the training run."""
-
-    def __init__(self, warmup_steps: int, cycle_steps: int, **kwargs) -> None:
-        super().__init__(**kwargs)
-        self.warmup_steps = int(warmup_steps)
-        self.cycle_steps = int(cycle_steps)
-        if self.warmup_steps < 0:
-            raise ValueError('warmup_steps must be non-negative.')
-        if self.cycle_steps <= self.warmup_steps:
-            raise ValueError(
-                'cycle_steps must be greater than warmup_steps.')
-
-    def build_scheduler(self, runner, optimizer):
-        if self.cycle_steps < runner.num_training_steps:
-            raise ValueError(
-                f'cycle_steps={self.cycle_steps} is shorter than the '
-                f'training run ({runner.num_training_steps} steps).')
-        scheduler = get_cosine_schedule_with_warmup(
-            optimizer,
-            self.warmup_steps,
-            self.cycle_steps,
-        )
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = 0.0
-        return scheduler
-
-
 @LR_SCHEDULERS.register_module(name=['step-based', 'StepBasedLRScheduler'])
 class StepBasedLRScheduler(BaseLRSchedulerPolicy):
 

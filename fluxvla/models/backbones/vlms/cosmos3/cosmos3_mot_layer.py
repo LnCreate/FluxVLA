@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: OpenMDW-1.1
 # flake8: noqa
 
+from typing import Any, Callable, Type
+
 import torch
 from torch import nn
-from typing import Any, Callable, Type
 # Qwen3-VL imports
 from transformers.models.qwen3_vl.configuration_qwen3_vl import \
     Qwen3VLTextConfig

@@ -82,10 +82,6 @@ class LiberoEvalRunner(BaseEvalRunner):
         inference_seed (int): Seed forwarded to ``predict_action`` on every
             prediction (e.g. to match a source eval that re-seeds the action
             noise each call). When ``None`` (default) no seed is forwarded.
-        guidance (float): Optional classifier-free guidance override forwarded
-            to ``predict_action``.
-        shift (float): Optional scheduler shift override forwarded to
-            ``predict_action``.
         allowed_missing_key_prefixes (tuple): Checkpoint keys with these
             prefixes may be missing when loading with ``strict=False``.
             Defaults to empty, which keeps strict missing-key validation.
@@ -393,8 +389,6 @@ class LiberoEvalRunner(BaseEvalRunner):
                  num_inference_steps: int = None,
                  max_steps: int = None,
                  inference_seed: int = None,
-                 guidance: float = None,
-                 shift: float = None,
                  allowed_missing_key_prefixes: tuple = (),
                  model_build_device: str = None,
                  model_build_dtype: str = None,
@@ -486,8 +480,6 @@ class LiberoEvalRunner(BaseEvalRunner):
         self.num_inference_steps = num_inference_steps
         self.max_steps = max_steps
         self.inference_seed = inference_seed
-        self.guidance = guidance
-        self.shift = shift
         self.model_build_device = model_build_device
         self.model_build_dtype = self._resolve_model_build_dtype(
             model_build_dtype)
@@ -729,10 +721,6 @@ class LiberoEvalRunner(BaseEvalRunner):
                             self.num_inference_steps
                     if self.inference_seed is not None:
                         predict_kwargs['seed'] = self.inference_seed
-                    if self.guidance is not None:
-                        predict_kwargs['guidance'] = self.guidance
-                    if self.shift is not None:
-                        predict_kwargs['shift'] = self.shift
                     with torch.autocast(
                             'cuda',
                             dtype=self.mixed_precision_dtype,
@@ -883,8 +871,6 @@ class LiberoEvalRunner(BaseEvalRunner):
                 sf.write(f'eval_chunk_size: {self.eval_chunk_size}\n')
                 sf.write(f'num_steps_wait: {self.num_steps_wait}\n')
                 sf.write(f'num_inference_steps: {self.num_inference_steps}\n')
-                sf.write(f'guidance: {self.guidance}\n')
-                sf.write(f'shift: {self.shift}\n')
                 sf.write(f'max_steps: {self.max_steps}\n')
                 sf.write(f'eval_shard_strategy: {self.eval_shard_strategy}\n')
                 sf.write(

@@ -101,52 +101,6 @@ class Cosmos3ComponentsMixin:
             b=3 * std,
         )
 
-    def _reinitialize_action_policy(self) -> tuple[str, ...]:
-        """Apply the explicit post-checkpoint action initialization policy."""
-        policy = getattr(self, 'action_init', 'checkpoint')
-        if policy == 'checkpoint':
-            return ()
-        if policy == 'fresh_all':
-            for projector in (self.action_in_proj, self.action_out_proj):
-                self._init_domain_aware_like_cosmos3(projector)
-            std = 1.0 / math.sqrt(self.hidden_size)
-            nn.init.trunc_normal_(
-                self.action_modality_embed.weight,
-                std=std,
-                a=-3 * std,
-                b=3 * std,
-            )
-            return (
-                'action_in_proj.*',
-                'action_out_proj.*',
-                'action_modality_embed.weight',
-            )
-
-        initialized = []
-        with torch.no_grad():
-            for name, projector in (
-                    ('action_in_proj', self.action_in_proj),
-                    ('action_out_proj', self.action_out_proj),
-            ):
-                if not isinstance(projector, DomainAwareLinear):
-                    raise TypeError(
-                        'fresh_domain requires DomainAwareLinear action '
-                        f'projectors, got {type(projector).__name__}.')
-                std = 1.0 / math.sqrt(projector.input_size)
-                for domain_id in self.fresh_action_domain_ids:
-                    nn.init.trunc_normal_(
-                        projector.fc.weight[domain_id],
-                        std=std,
-                        a=-3 * std,
-                        b=3 * std,
-                    )
-                    projector.bias.weight[domain_id].zero_()
-                    initialized.extend([
-                        f'{name}.fc.weight[{domain_id}]',
-                        f'{name}.bias.weight[{domain_id}]',
-                    ])
-        return tuple(initialized)
-
     @staticmethod
     def _projector_dim(module: nn.Module, kind: str) -> Optional[int]:
         attr_name = 'input_size' if kind == 'in' else 'output_size'

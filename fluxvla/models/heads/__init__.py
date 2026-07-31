@@ -12,15 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import torch
-
 from .flow_matching_head import FlowMatchingHead  # noqa: F401, F403
-# The optimized inference head imports Triton autotuners that instantiate a
-# CUDA driver at import time.  Robot-side ZMQ clients and CPU-only config/test
-# tools still need to import ``fluxvla`` without a local CUDA driver.
-if torch.cuda.is_available():
-    from .flow_matching_inference_head import \
-        FlowMatchingInferenceHead  # noqa: F401, F403
+from .flow_matching_inference_head import \
+    FlowMatchingInferenceHead  # noqa: F401, F403
 from .llava_action_head import LlavaActionHead  # noqa: F401, F403
 from .openvla_head import OpenVLAHead  # noqa: F401, F403
 from .xvla_head import XVLAFlowMatchingHead  # noqa: F401, F403

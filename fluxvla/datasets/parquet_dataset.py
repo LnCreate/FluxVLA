@@ -46,26 +46,21 @@ class ParquetDataset(Dataset):
     HF_REPO_ID = 'limxdynamics/FluxVLAData'
     HF_REVISION = 'main'
 
-    def __init__(
-            self,
-            data_root_path: Union[str, List[str]],
-            transforms: List[Dict],
-            action_window_size: int = 9,
-            action_key: str = 'observation.state',
-            use_delta: bool = False,
-            statistic_name: str = 'private',
-            window_start_idx: int = 1,
-            frame_window_size: int = 1,
-            frame_sample_stride: int = 1,
-            require_full_window: bool = False,
-            train_episode_fraction: Optional[float] = None,
-            repeat_to_full_length: bool = False,
-            expose_index: bool = False,
-            expected_dataset_version: Optional[str] = None,
-            task_indices: Optional[List[int]] = None,
-            episode_fraction_range: Optional[tuple[float,
-                                                   float]] = None,
-            max_windows: Optional[int] = None) -> None:
+    def __init__(self,
+                 data_root_path: Union[str, List[str]],
+                 transforms: List[Dict],
+                 action_window_size: int = 9,
+                 action_key: str = 'observation.state',
+                 use_delta: bool = False,
+                 statistic_name: str = 'private',
+                 window_start_idx: int = 1,
+                 frame_window_size: int = 1,
+                 frame_sample_stride: int = 1,
+                 require_full_window: bool = False,
+                 train_episode_fraction: float = 1.0,
+                 repeat_to_full_length: bool = False,
+                 expose_index: bool = False,
+                 expected_dataset_version: Optional[str] = None) -> None:
         """Initialize the Parquet dataset.
 
         Args:
@@ -101,15 +96,7 @@ class ParquetDataset(Dataset):
                 ``(frame_window_size - 1) * frame_sample_stride`` rows.
             train_episode_fraction (float): Fraction of episodes to sample
                 from each data root, preserving original episode order.
-                The legacy value ``f`` is equivalent to the leading range
-                ``[0, f)`` while retaining the old at-least-one-episode
-                behavior. Mutually exclusive with ``episode_fraction_range``.
-                Defaults to all episodes when neither option is provided.
-            episode_fraction_range (tuple[float, float], optional): Normalized
-                half-open episode range ``[start, end)`` selected independently
-                from each data root in original episode order. For example,
-                ``(0.8, 0.9)`` selects the validation tenth. Boundaries must
-                satisfy ``0 <= start < end <= 1``. Empty selections fail fast.
+                Defaults to 1.0.
             require_full_window (bool): If True, reject starts whose action or
                 video window would cross an episode/dataset boundary. This
                 avoids padded tail windows.
@@ -124,17 +111,10 @@ class ParquetDataset(Dataset):
             expected_dataset_version (str, optional): Expected FluxVLA dataset
                 content version. If omitted, no version check is performed so
                 existing local datasets remain usable.
-            task_indices (list[int], optional): Keep rows belonging to these
-                task indices. Intended for single-task smoke runs; filtering
-                happens before random resampling.
-            max_windows (int, optional): Deterministically retain exactly the
-                first N valid starts after episode/task/full-window filtering.
-                Fail if fewer than N starts exist. Intended for small-set
-                overfit gates, not normal training.
         """
         super().__init__()
-        self._validate_episode_split(train_episode_fraction,
-                                     episode_fraction_range)
+        if not 0 < train_episode_fraction <= 1:
+            raise ValueError('train_episode_fraction must be in (0, 1].')
         self.action_window_size = action_window_size
         if isinstance(data_root_path, str):
             data_root_path = [data_root_path]
@@ -197,6 +177,12 @@ class ParquetDataset(Dataset):
         self.dataset_cumulative_sizes = np.cumsum([0] + dataset_sizes)
         self.dataset = hf_dataset
         self.full_length = len(self.dataset)
+        self.sample_indices = self._build_sample_indices(
+            train_episode_fraction)
+        self.effective_length = (
+            self.full_length
+            if repeat_to_full_length else len(self.sample_indices))
+        self.transforms = list()
         self.action_key = action_key
         self.use_delta = use_delta
         self.statistic_name = statistic_name
@@ -205,18 +191,6 @@ class ParquetDataset(Dataset):
         self.frame_sample_stride = frame_sample_stride
         self.require_full_window = require_full_window
         self.expose_index = expose_index
-        self.sample_indices = self._build_sample_indices(
-            train_episode_fraction, episode_fraction_range)
-        self.sample_indices = self._filter_task_indices(
-            self.sample_indices, task_indices)
-        self.sample_indices = self._filter_valid_start_indices(
-            self.sample_indices)
-        self.sample_indices = self._limit_sample_windows(
-            self.sample_indices, max_windows)
-        self.effective_length = (
-            self.full_length
-            if repeat_to_full_length else len(self.sample_indices))
-        self.transforms = list()
         for transform in transforms:
             self.transforms.append(build_transform_from_cfg(transform))
 
@@ -273,150 +247,28 @@ class ParquetDataset(Dataset):
                 f'{dataset_version or "missing"} in {version_path}.\n\n'
                 f'Please refresh the dataset with:\n\n{refresh_command}')
 
-    @staticmethod
-    def _validate_episode_split(
-        train_episode_fraction: Optional[float],
-        episode_fraction_range: Optional[tuple[float, float]],
-    ) -> tuple[tuple[float, float], bool]:
-        """Validate split options and return ``(range, legacy_mode)``."""
-        if (train_episode_fraction is not None
-                and episode_fraction_range is not None):
-            raise ValueError(
-                'train_episode_fraction and episode_fraction_range are '
-                'mutually exclusive.')
-
-        if train_episode_fraction is not None:
-            fraction = float(train_episode_fraction)
-            if not np.isfinite(fraction) or not 0 < fraction <= 1:
-                raise ValueError(
-                    'train_episode_fraction must be finite and in (0, 1].')
-            return (0.0, fraction), True
-
-        if episode_fraction_range is None:
-            return (0.0, 1.0), False
-        if (not isinstance(episode_fraction_range, (list, tuple))
-                or len(episode_fraction_range) != 2):
-            raise ValueError(
-                'episode_fraction_range must contain exactly (start, end).')
-        start, end = (float(value) for value in episode_fraction_range)
-        if (not np.isfinite(start) or not np.isfinite(end)
-                or not 0 <= start < end <= 1):
-            raise ValueError('episode_fraction_range must satisfy '
-                             '0 <= start < end <= 1 with finite values.')
-        return (start, end), False
-
-    def _build_sample_indices(
-        self,
-        episode_fraction: Optional[float] = None,
-        episode_fraction_range: Optional[tuple[float, float]] = None,
-    ) -> np.ndarray:
-        fraction_range, legacy_mode = self._validate_episode_split(
-            episode_fraction, episode_fraction_range)
-        if fraction_range == (0.0, 1.0):
+    def _build_sample_indices(self, episode_fraction: float) -> np.ndarray:
+        if episode_fraction == 1.0:
             return np.arange(self.full_length, dtype=np.int64)
 
-        try:
-            episode_indices = list(self.dataset['episode_index'])
-        except (TypeError, KeyError):
-            episode_indices = [row['episode_index'] for row in self.dataset]
+        episode_indices = list(self.dataset['episode_index'])
         sample_indices = []
-        for root_index, (root_start, root_end) in enumerate(
-                zip(self.dataset_cumulative_sizes[:-1],
-                    self.dataset_cumulative_sizes[1:])):
-            root_start, root_end = int(root_start), int(root_end)
-            local_episode_indices = episode_indices[root_start:root_end]
+        for start, end in zip(self.dataset_cumulative_sizes[:-1],
+                              self.dataset_cumulative_sizes[1:]):
+            start, end = int(start), int(end)
+            local_episode_indices = episode_indices[start:end]
             ordered_episodes = list(dict.fromkeys(local_episode_indices))
-            range_start, range_end = fraction_range
-            first_episode = int(len(ordered_episodes) * range_start)
-            last_episode = int(len(ordered_episodes) * range_end)
-            if legacy_mode:
-                last_episode = max(1, min(last_episode, len(ordered_episodes)))
-            keep_episodes = set(ordered_episodes[first_episode:last_episode])
-            if not keep_episodes:
-                raise ValueError(
-                    'Episode fraction split selects no episodes from data '
-                    f'root {root_index} with {len(ordered_episodes)} '
-                    f'episodes: range={fraction_range}.')
+            keep_count = int(len(ordered_episodes) * episode_fraction)
+            keep_count = max(1, min(keep_count, len(ordered_episodes)))
+            keep_episodes = set(ordered_episodes[:keep_count])
             sample_indices.extend(
-                root_start + offset
+                start + offset
                 for offset, episode in enumerate(local_episode_indices)
                 if episode in keep_episodes)
 
         if not sample_indices:
             raise ValueError('No samples left after applying episode split.')
         return np.asarray(sample_indices, dtype=np.int64)
-
-    def _filter_task_indices(
-        self,
-        sample_indices: np.ndarray,
-        task_indices: Optional[List[int]],
-    ) -> np.ndarray:
-        if task_indices is None:
-            return sample_indices
-        allowed = {int(value) for value in task_indices}
-        if not allowed:
-            raise ValueError('task_indices must not be empty when provided.')
-        selected = []
-        for index in sample_indices:
-            row = self.dataset[int(index)]
-            value = row.get('task_index', row.get('task'))
-            if isinstance(value, np.ndarray) and value.size == 1:
-                value = value.item()
-            if isinstance(value, torch.Tensor) and value.numel() == 1:
-                value = value.item()
-            if isinstance(value, (int, np.integer)) and int(value) in allowed:
-                selected.append(int(index))
-        if not selected:
-            raise ValueError(
-                f'No samples match task_indices={sorted(allowed)}.')
-        return np.asarray(selected, dtype=np.int64)
-
-    def _filter_valid_start_indices(
-            self, sample_indices: np.ndarray) -> np.ndarray:
-        """Keep only starts that contain every requested action/frame.
-
-        Full-window datasets previously left invalid tail rows in the sample
-        pool and retried randomly in ``__getitem__``.  Besides wasting work,
-        that loop never terminates when no episode contains a complete
-        window.  Resolve the finite valid pool once during initialization so
-        failures are deterministic and immediate.
-        """
-        if not self.require_full_window:
-            return sample_indices
-
-        valid_indices = []
-        for index in sample_indices:
-            index = int(index)
-            dataset_idx = self._get_dataset_index(index)
-            data = self.dataset[index]
-            if not self._invalid_start_index(index, dataset_idx, data):
-                valid_indices.append(index)
-
-        if not valid_indices:
-            raise ValueError(
-                'No valid sample starts remain with '
-                'require_full_window=True. Check episode lengths, action '
-                'window, frame window/stride, and task filters.')
-        return np.asarray(valid_indices, dtype=np.int64)
-
-    @staticmethod
-    def _limit_sample_windows(
-        sample_indices: np.ndarray,
-        max_windows: Optional[int],
-    ) -> np.ndarray:
-        """Select a deterministic, exact-size window subset for overfitting."""
-        if max_windows is None:
-            return sample_indices
-        if (isinstance(max_windows, bool)
-                or not isinstance(max_windows, (int, np.integer))
-                or int(max_windows) <= 0):
-            raise ValueError('max_windows must be a positive integer.')
-        max_windows = int(max_windows)
-        if len(sample_indices) < max_windows:
-            raise ValueError(
-                f'max_windows={max_windows} requested, but only '
-                f'{len(sample_indices)} valid starts remain after filtering.')
-        return np.asarray(sample_indices[:max_windows], dtype=np.int64)
 
     def _resolve_index(self, index: int) -> int:
         sample_index = index % len(self.sample_indices)
@@ -455,25 +307,11 @@ class ParquetDataset(Dataset):
             return True
 
         if self.require_full_window:
-            frame_end_index = index + (
-                (self.frame_window_size - 1) * self.frame_sample_stride)
-            if not self._same_episode_and_dataset(frame_end_index, dataset_idx,
-                                                  data):
+            window_size = max(self.frame_window_size,
+                              self.window_start_idx + self.action_window_size)
+            if not self._same_episode_and_dataset(index + window_size - 1,
+                                                  dataset_idx, data):
                 return True
-
-            num_actions = 0
-            window_idx = self.window_start_idx
-            while num_actions < self.action_window_size:
-                action_index = index + window_idx
-                if not self._same_episode_and_dataset(action_index,
-                                                      dataset_idx, data):
-                    return True
-                action_task = self._get_task_name(dataset_idx, action_index)
-                if action_task == 'empty':
-                    return True
-                if action_task != 'static':
-                    num_actions += 1
-                window_idx += 1
 
         first_action_index = index + self.window_start_idx
         if first_action_index == index:

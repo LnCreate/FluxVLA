@@ -351,12 +351,7 @@ def two_way_attention(
     backend: str | None = None,
     full_key_states: FactoredSequencePack | JointSequencePack | None = None,
 ) -> FactoredSequencePack | JointSequencePack:
-    """Run dense two-way MoT attention on packed sequences.
-
-    ``full_key_states`` allows Edge's generation queries to use the dedicated
-    normalization of understanding keys while causal/reasoner queries retain
-    their normal key path. Nano/Super leave it unset.
-    """
+    """Run dense two-way MoT attention on packed sequences."""
     _check_backend(backend)
 
     causal_q, causal_q_offsets = get_causal_seq(packed_query_states)

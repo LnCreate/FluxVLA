@@ -234,14 +234,11 @@ class FSDPTrainRunner(BaseTrainRunner):
                     'epoch': epoch,
                 }
 
-                if self.optimizer is not None:
-                    checkpoint_dict['optimizer_param_group_topology'] = (
-                        self._optimizer_param_group_topology())
-
                 # Save scheduler state
                 if self.lr_scheduler is not None:
-                    checkpoint_dict['scheduler_state_dict'] = (
-                        self._scheduler_state_for_checkpoint())
+                    checkpoint_dict[
+                        'scheduler_state_dict'] = self.lr_scheduler.state_dict(
+                        )
 
                 # Save full optimizer state dict (only on rank 0)
                 if full_optimizer_state_dict is not None:
@@ -264,16 +261,14 @@ class FSDPTrainRunner(BaseTrainRunner):
                 if os.path.islink(latest_ckpt_link) or os.path.exists(
                         latest_ckpt_link):
                     os.remove(latest_ckpt_link)
-                # Keep latest links relocatable when the complete run bundle
-                # is staged from the training host to a serving host.
-                os.symlink(os.path.basename(checkpoint_path), latest_ckpt_link)
+                os.symlink(os.path.abspath(checkpoint_path), latest_ckpt_link)
 
                 latest_sf_link = os.path.join(checkpoint_dir,
                                               'latest-checkpoint.safetensors')
                 if os.path.islink(latest_sf_link) or os.path.exists(
                         latest_sf_link):
                     os.remove(latest_sf_link)
-                os.symlink(os.path.basename(safetensors_path), latest_sf_link)
+                os.symlink(os.path.abspath(safetensors_path), latest_sf_link)
 
                 self._cleanup_old_checkpoints(checkpoint_dir)
 

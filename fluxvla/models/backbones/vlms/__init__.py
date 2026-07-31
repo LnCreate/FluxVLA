@@ -12,14 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import torch
-
 from .cosmos3 import (Cosmos3EdgeBackbone,  # noqa: F401, F403
                       Cosmos3MoTBackbone)
-if torch.cuda.is_available():
-    # Eagle imports Triton autotuners that require a live CUDA driver at
-    # import time. Keep the rest of the registry usable for CPU config/tests.
-    from .eagle import EagleBackbone, EagleInferenceBackbone  # noqa: F401,F403
+from .eagle import EagleBackbone, EagleInferenceBackbone  # noqa: F401, F403
 from .florence2 import Florence2Backbone  # noqa: F401, F403
 from .paligemma import PaliGemma  # noqa: F401, F403
 from .qwen2_5_vl import QWen2_5VL  # noqa: F401, F403

@@ -451,24 +451,26 @@ class NormalizeStatesAndActions:
         assert stats['q99'] is not None
         if norm_mask is None:
             norm_mask = [True] * x.shape[-1]
-        q01 = np.asarray(stats['q01'], dtype=x.dtype)
-        q99 = np.asarray(stats['q99'], dtype=x.dtype)
-        normalized = ((x - q01) / (q99 - q01 + 1e-6) * 2.0 - 1.0)
+        normalized = (
+            (x - np.array(stats['q01'])) /
+            (np.array(stats['q99']) - np.array(stats['q01']) + 1e-6) * 2.0 -
+            1.0)
         if self.clip_norm:
             normalized = np.clip(normalized, -1, 1)
-        return np.where(norm_mask, normalized, x).astype(x.dtype, copy=False)
+        return np.where(norm_mask, normalized, x)
 
     def _normalize_min_max(self, x, stats: Dict, norm_mask: List[bool] = None):
         assert 'min' in stats and stats['min'] is not None
         assert 'max' in stats and stats['max'] is not None
         if norm_mask is None:
             norm_mask = [True] * x.shape[-1]
-        low = np.asarray(stats['min'], dtype=x.dtype)
-        high = np.asarray(stats['max'], dtype=x.dtype)
-        normalized = ((x - low) / (high - low + 1e-6) * 2.0 - 1.0)
+        normalized = (
+            (x - np.array(stats['min'])) /
+            (np.array(stats['max']) - np.array(stats['min']) + 1e-6) * 2.0 -
+            1.0)
         if self.clip_norm:
             normalized = np.clip(normalized, -1, 1)
-        return np.where(norm_mask, normalized, x).astype(x.dtype, copy=False)
+        return np.where(norm_mask, normalized, x)
 
 
 @TRANSFORMS.register_module()
@@ -513,11 +515,9 @@ class LiberoProprioFromInputs:
         assert self.pos_key in data and self.quat_key in \
             data and self.gripper_key in data, \
             f'Missing proprio keys in data: {self.pos_key}, {self.quat_key}, {self.gripper_key}'  # noqa: E501
-        robot0_eef_pos = np.asarray(data[self.pos_key], dtype=np.float32)
-        robot0_eef_quat = np.asarray(
-            data[self.quat_key], dtype=np.float32)
-        robot0_gripper_qpos = np.asarray(
-            data[self.gripper_key], dtype=np.float32)
+        robot0_eef_pos = np.asarray(data[self.pos_key])
+        robot0_eef_quat = np.asarray(data[self.quat_key])
+        robot0_gripper_qpos = np.asarray(data[self.gripper_key])
 
         state = np.concatenate((
             robot0_eef_pos,
@@ -535,10 +535,10 @@ class LiberoProprioFromInputs:
 
         out = dict(data)
         if self.state_dim is not None:
-            out[self.out_key] = np.zeros((self.state_dim), dtype=np.float32)
+            out[self.out_key] = np.zeros((self.state_dim))
             out[self.out_key][:state.shape[0]] = state
         else:
-            out[self.out_key] = state.astype(np.float32, copy=False)
+            out[self.out_key] = state
         return out
 
     def _normalize(self, normalized_states: np.ndarray, stats: Dict):
@@ -556,7 +556,7 @@ class LiberoProprioFromInputs:
             (np.array(stats['std']) + 1e-6),
             normalized_states,
         )
-        return states.astype(normalized_states.dtype, copy=False)
+        return states
 
     def _normalize_quantile(self, normalized_states: np.ndarray, stats: Dict):
         assert 'q01' in stats and stats['q01'] is not None
@@ -572,7 +572,7 @@ class LiberoProprioFromInputs:
             np.clip(
                 2 * (normalized_states - state_low) /
                 (state_high - state_low + 1e-8) - 1, -1, 1), normalized_states)
-        return states.astype(normalized_states.dtype, copy=False)
+        return states
 
     def _normalize_min_max(self, normalized_states: np.ndarray, stats: Dict):
         assert 'min' in stats and stats['min'] is not None
@@ -588,4 +588,4 @@ class LiberoProprioFromInputs:
             np.clip(
                 2 * (normalized_states - state_low) /
                 (state_high - state_low + 1e-8) - 1, -1, 1), normalized_states)
-        return states.astype(normalized_states.dtype, copy=False)
+        return states

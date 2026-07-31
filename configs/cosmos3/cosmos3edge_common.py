@@ -6,10 +6,10 @@
 
 from copy import deepcopy
 from pathlib import Path
-from runpy import run_path
 
 
-EDGE_BASE_CHECKPOINT = './checkpoints/Cosmos3-Edge'
+EDGE_ROOT = './checkpoints/Cosmos3-Edge'
+EDGE_BASE_CHECKPOINT = EDGE_ROOT + '/transformer'
 WAN22_VAE = './checkpoints/Wan2.2-TI2V-5B/Wan2.2_VAE.pth'
 
 EDGE_TEXT_CONFIG = dict(
@@ -42,23 +42,32 @@ EDGE_SPECIAL_TOKENS = dict(
     end_of_generation=21,
 )
 
-
-def _checkpoint_action_layout(checkpoint):
-    """Read Dmax/domain count from the checkpoint header when available.
-
-    Configs remain inspectable before weights are downloaded, using the
-    published VFM layout as an expected fallback.  A real checkpoint present
-    at launch is authoritative and any absent/ambiguous action head is fatal.
-    """
-    path = Path(checkpoint).expanduser()
-    expected = (64, 32)
-    if not path.exists():
-        return expected
-
-    source = (Path(__file__).resolve().parents[2] /
-              'fluxvla/models/vlas/cosmos3/checkpoint_mixin.py')
-    infer = run_path(str(source))['infer_cosmos3_action_layout']
-    return infer(path)
+EDGE_NAME_MAPPING = {
+    'action_modality_embed.weight': 'action_modality_embed',
+    'vlm_backbone.model.language_model.embed_tokens.weight':
+    'embed_tokens.weight',
+    'vlm_backbone.lm_head.weight': 'lm_head.weight',
+    'vlm_backbone.model.language_model.norm.weight': 'norm.weight',
+    'vlm_backbone.model.language_model.norm_moe_gen.weight':
+    'norm_moe_gen.weight',
+    'vlm_backbone.model.language_model.layers.': 'layers.',
+    'vision_in_proj.projector.': 'proj_in.',
+    'vision_out_proj.projector.': 'proj_out.',
+    'time_embedder.mlp.0.': 'time_embedder.linear_1.',
+    'time_embedder.mlp.2.': 'time_embedder.linear_2.',
+    'action_in_proj.': 'action_proj_in.',
+    'action_out_proj.': 'action_proj_out.',
+    '.self_attn.q_proj.': '.self_attn.to_q.',
+    '.self_attn.k_proj.': '.self_attn.to_k.',
+    '.self_attn.v_proj.': '.self_attn.to_v.',
+    '.self_attn.o_proj.': '.self_attn.to_out.',
+    '.self_attn.q_proj_moe_gen.': '.self_attn.add_q_proj.',
+    '.self_attn.k_proj_moe_gen.': '.self_attn.add_k_proj.',
+    '.self_attn.v_proj_moe_gen.': '.self_attn.add_v_proj.',
+    '.self_attn.o_proj_moe_gen.': '.self_attn.to_add_out.',
+    '.self_attn.q_norm_moe_gen.': '.self_attn.norm_added_q.',
+    '.self_attn.k_norm_moe_gen.': '.self_attn.norm_added_k.',
+}
 
 
 def _tokenizer(checkpoint):
@@ -77,16 +86,11 @@ def _model(
     horizon,
     tuning='partial',
     enable_vision_loss=True,
-    action_layout=None,
-    action_init='checkpoint',
-    fresh_action_domain_ids=None,
 ):
-    if tuning not in {'action', 'lora', 'partial', 'full'}:
+    if tuning not in {'partial', 'full'}:
         raise ValueError(f'Unsupported Cosmos3-Edge tuning mode: {tuning}')
     hidden_size = EDGE_TEXT_CONFIG['hidden_size']
-    max_action_dim, num_domains = (
-        _checkpoint_action_layout(checkpoint)
-        if action_layout is None else action_layout)
+    max_action_dim, num_domains = 64, 32
     if max_action_dim < raw_action_dim:
         raise ValueError(
             f'Checkpoint Dmax={max_action_dim} is smaller than raw action '
@@ -158,9 +162,8 @@ def _model(
         base_fps=24.0,
         special_tokens=deepcopy(EDGE_SPECIAL_TOKENS),
         pretrained_name_or_path=checkpoint,
+        name_mapping=deepcopy(EDGE_NAME_MAPPING),
         strict_mapping=True,
-        checkpoint_min_coverage=1.0,
-        action_init=action_init,
         vision_vae=dict(
             type='Cosmos3Wan22VAE',
             pretrained_name_or_path=WAN22_VAE,
@@ -168,33 +171,10 @@ def _model(
         ),
         ori_action_dim=raw_action_dim,
         action_horizon=horizon,
-        freeze_vlm_backbone=tuning in {'action', 'lora'},
+        freeze_vlm_backbone=False,
         freeze_non_moe_vlm_backbone=tuning == 'partial',
-        freeze_non_action_components=tuning == 'action',
         enable_vision_loss=enable_vision_loss,
     )
-    if fresh_action_domain_ids is not None:
-        model['fresh_action_domain_ids'] = list(fresh_action_domain_ids)
-    if tuning == 'lora':
-        model.update(
-            use_lora=True,
-            lora_rank=32,
-            lora_alpha=64,
-            lora_dropout=0.0,
-            lora_target_modules=[
-                'self_attn.q_proj_moe_gen',
-                'self_attn.k_proj_moe_gen',
-                'self_attn.v_proj_moe_gen',
-                'self_attn.o_proj_moe_gen',
-                'mlp_moe_gen.up_proj',
-                'mlp_moe_gen.down_proj',
-            ],
-            modules_to_save=[
-                'action_in_proj',
-                'action_out_proj',
-                'action_modality_embed',
-            ],
-        )
     return model
 
 
@@ -204,13 +184,10 @@ def _collator(pad_id=11):
         tensor_keys=[
             'images',
             'actions',
-            'states',
             'embodiment_ids',
             'raw_action_dim',
             'conditioning_fps',
             'action_fps',
-            'action_masks',
-            'frame_masks',
         ],
         sequence_keys=['text_token_ids'],
         list_keys=['sequence_plan'],
@@ -223,7 +200,7 @@ def _runner(tokenizer, tuning, max_steps, save_interval=500):
     action_lr = 2e-4
     base_lr = action_lr if tuning == 'action' else 4e-5
     common = dict(
-        type='DDPTrainRunner' if tuning == 'lora' else 'FSDPTrainRunner',
+        type='FSDPTrainRunner',
         max_steps=max_steps,
         max_epochs=None,
         optimizer=dict(
@@ -237,10 +214,6 @@ def _runner(tokenizer, tuning, max_steps, save_interval=500):
                 'action_in_proj.': action_lr,
                 'action_out_proj.': action_lr,
                 'action_modality_embed': action_lr,
-                # PEFT wraps modules-to-save below base_model.model.*.
-                'base_model.model.action_in_proj.': action_lr,
-                'base_model.model.action_out_proj.': action_lr,
-                'base_model.model.action_modality_embed.': action_lr,
             },
         ),
         max_grad_norm=1.0,
@@ -265,10 +238,7 @@ def _runner(tokenizer, tuning, max_steps, save_interval=500):
         enable_mixed_precision_training=True,
         mixed_precision_dtype='bf16',
     )
-    if tuning == 'lora':
-        common['static_graph'] = False
-    else:
-        common.update(sharding_strategy='full-shard', change_key_name=False)
+    common.update(sharding_strategy='full-shard', change_key_name=False)
     return common
 
 
@@ -277,15 +247,10 @@ def build_libero_config(
     tuning='partial',
     max_steps=2000,
     save_interval=500,
-    task_indices=None,
-    max_windows=None,
     eval_task_ids=None,
     eval_trials=50,
     seed=7,
     cfg_dropout_rate=0.1,
-    action_init='checkpoint',
-    fresh_action_domain_ids=None,
-    action_layout=None,
     data_root_path=None,
 ):
     suite_to_data = {
@@ -304,29 +269,9 @@ def build_libero_config(
         ]
     else:
         data_root_path = str(Path(data_root_path).expanduser())
-    if action_init not in {'checkpoint', 'fresh_domain', 'fresh_all'}:
-        raise ValueError(f'Unsupported action_init: {action_init!r}')
-    if action_init == 'fresh_domain' and fresh_action_domain_ids is None:
-        fresh_action_domain_ids = [5]
-    if action_init != 'fresh_domain' and fresh_action_domain_ids is not None:
-        raise ValueError(
-            'fresh_action_domain_ids is only valid with '
-            'action_init="fresh_domain".')
     checkpoint = EDGE_BASE_CHECKPOINT
-    action_layout = (_checkpoint_action_layout(checkpoint)
-                     if action_layout is None else tuple(action_layout))
-    if (len(action_layout) != 2 or int(action_layout[0]) < 7
-            or int(action_layout[1]) <= 5):
-        raise ValueError(
-            'LIBERO action_layout must be (Dmax>=7, num_domains>5), got '
-            f'{action_layout}.')
-    action_layout = (int(action_layout[0]), int(action_layout[1]))
-    max_action_dim, _ = action_layout
-    if action_layout[1] <= 5:
-        raise ValueError(
-            f'Checkpoint has {action_layout[1]} domains; LIBERO domain 5 '
-            'is unavailable.')
-    tokenizer = _tokenizer(checkpoint)
+    max_action_dim = 64
+    tokenizer = _tokenizer(EDGE_ROOT)
     horizon = 16
     frame_window = horizon + 1
     raw_dim = 7
@@ -336,8 +281,7 @@ def build_libero_config(
         dict(
             type='ProcessParquetInputs',
             parquet_keys=[
-                'observation.state', 'timestamp', 'actions', 'info', 'stats',
-                'action_masks', 'frame_masks'
+                'observation.state', 'timestamp', 'actions', 'info', 'stats'
             ],
             video_keys=[
                 'observation.images.image',
@@ -352,12 +296,6 @@ def build_libero_config(
         dict(
             type='ProcessCosmos3Prompt',
             tokenizer=tokenizer,
-            expected_vocab_size=EDGE_TEXT_CONFIG['vocab_size'],
-            expected_special_token_ids=dict(
-                pad_token_id=EDGE_TEXT_CONFIG['pad_token_id'],
-                bos_token_id=EDGE_TEXT_CONFIG['bos_token_id'],
-                **EDGE_SPECIAL_TOKENS,
-            ),
             max_len=512,
             cfg_dropout_rate=cfg_dropout_rate,
             action_metadata=dict(
@@ -400,10 +338,7 @@ def build_libero_config(
         raw_action_dim=raw_dim,
         horizon=horizon,
         tuning=tuning,
-        enable_vision_loss=tuning not in {'action', 'lora'},
-        action_layout=action_layout,
-        action_init=action_init,
-        fresh_action_domain_ids=fresh_action_domain_ids,
+        enable_vision_loss=True,
     )
     train_dataloader = dict(
         per_device_batch_size=1,
@@ -427,8 +362,6 @@ def build_libero_config(
                 window_start_idx=0,
                 frame_window_size=frame_window,
                 require_full_window=True,
-                task_indices=task_indices,
-                max_windows=max_windows,
             ),
         ),
     )
@@ -445,16 +378,13 @@ def build_libero_config(
         seed=seed,
         inference_seed=seed,
         num_inference_steps=10,
-        guidance=1.0,
-        shift=10.0,
         enable_mixed_precision_training=True,
         mixed_precision_dtype='bf16',
         dataset=dict(
             type='LiberoParquetEvalDataset',
             img_buffer_len=1,
             extra_tensor_keys=[
-                'conditioning_fps', 'action_fps', 'raw_action_dim',
-                'prepend_state_to_action', 'negative_text_token_ids'
+                'conditioning_fps', 'prepend_state_to_action'
             ],
             transforms=[
                 dict(
@@ -465,8 +395,6 @@ def build_libero_config(
                 dict(
                     type='SetCosmos3ActionMetadata',
                     conditioning_fps=20.0,
-                    action_fps=20.0,
-                    raw_action_dim=raw_dim,
                     prepend_state_to_action=False,
                 ),
                 dict(
@@ -479,12 +407,6 @@ def build_libero_config(
                 dict(
                     type='ProcessCosmos3Prompt',
                     tokenizer=tokenizer,
-                    expected_vocab_size=EDGE_TEXT_CONFIG['vocab_size'],
-                    expected_special_token_ids=dict(
-                        pad_token_id=EDGE_TEXT_CONFIG['pad_token_id'],
-                        bos_token_id=EDGE_TEXT_CONFIG['bos_token_id'],
-                        **EDGE_SPECIAL_TOKENS,
-                    ),
                     max_len=512,
                     cfg_dropout_rate=0.0,
                     action_metadata=dict(
@@ -496,7 +418,6 @@ def build_libero_config(
                     ),
                     output_key='lang_tokens',
                     output_attention_mask_key='lang_masks',
-                    negative_output_key='negative_text_token_ids',
                 ),
                 dict(
                     type='LiberoProprioFromInputs',
@@ -557,7 +478,6 @@ def build_jikun_libero_single_config(suite='libero_spatial'):
         max_steps=1,
         eval_trials=50,
         data_root_path=data_root_path,
-        action_init='checkpoint',
     )
 
     for model_key in ('model', 'inference_model'):
@@ -575,11 +495,6 @@ def build_jikun_libero_single_config(suite='libero_spatial'):
     wrapper['statistic_name'] = statistic_name
     dataset = wrapper['datasets']
     dataset['statistic_name'] = statistic_name
-    # JiKun's implementation reports every source row in the epoch length and
-    # resamples invalid episode-tail starts. The hardened dataset prevalidates
-    # starts, then repeats them to retain exactly that exposure budget.
-    dataset['repeat_to_full_length'] = True
-
     for index, transform in enumerate(dataset['transforms']):
         if transform['type'] == 'ProcessCosmos3Prompt':
             transform['action_metadata'].update(

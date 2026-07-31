@@ -24,7 +24,6 @@ from fluxvla.models.third_party_models.cosmos3.model.vfm.mot import \
 from fluxvla.tokenizers.cosmos3_wan22_vae import Cosmos3Wan22VAE
 from .base_vla import BaseVLA
 from .cosmos3.action_embedding import ActionModalityEmbedding
-from .cosmos3.checkpoint_mixin import Cosmos3CheckpointMixin
 from .cosmos3.codec_mixin import Cosmos3CodecMixin
 from .cosmos3.components_mixin import Cosmos3ComponentsMixin
 from .cosmos3.flow_utils import (_as_action_list, _as_long_list, _as_text_ids,
@@ -44,8 +43,7 @@ overwatch = initialize_overwatch(__name__)
 @VLAS.register_module()
 class Cosmos3FlowMatching(Cosmos3ComponentsMixin, Cosmos3ScheduleMixin,
                           Cosmos3SequenceMixin, Cosmos3CodecMixin,
-                          Cosmos3LossMixin, Cosmos3InferenceMixin,
-                          Cosmos3CheckpointMixin, BaseVLA):
+                          Cosmos3LossMixin, Cosmos3InferenceMixin, BaseVLA):
     """FluxVLA-native Cosmos3 MoT flow matching model.
 
     This class intentionally exposes the MoT backbone, modality projectors,
@@ -79,21 +77,10 @@ class Cosmos3FlowMatching(Cosmos3ComponentsMixin, Cosmos3ScheduleMixin,
         special_tokens: Optional[Dict[str, int]] = None,
         freeze_vlm_backbone: bool = False,
         freeze_non_moe_vlm_backbone: bool = False,
-        freeze_non_action_components: bool = False,
         enable_vision_loss: bool = False,
-        use_lora: bool = False,
-        lora_rank: int = 32,
-        lora_alpha: Optional[int] = None,
-        lora_dropout: float = 0.0,
-        lora_target_modules: Optional[List[str] | str] = None,
-        modules_to_save: Optional[List[str]] = None,
         pretrained_name_or_path: Optional[str] = None,
         name_mapping: Optional[Dict] = None,
         strict_mapping: bool = False,
-        checkpoint_min_coverage: float = 1.0,
-        checkpoint_missing_allowlist: Optional[List[str]] = None,
-        action_init: str = 'checkpoint',
-        fresh_action_domain_ids: Optional[List[int]] = None,
         norm_stats: Optional[Dict] = None,
         torch_dtype: Optional[str | torch.dtype] = None,
     ) -> None:
@@ -117,26 +104,6 @@ class Cosmos3FlowMatching(Cosmos3ComponentsMixin, Cosmos3ScheduleMixin,
         )
 
         self.torch_dtype = self._resolve_torch_dtype(torch_dtype)
-        self.checkpoint_min_coverage = float(checkpoint_min_coverage)
-        if action_init not in {'checkpoint', 'fresh_domain', 'fresh_all'}:
-            raise ValueError(
-                'action_init must be checkpoint, fresh_domain, or fresh_all; '
-                f'got {action_init!r}.')
-        self.action_init = action_init
-        self.fresh_action_domain_ids = tuple(
-            int(value) for value in (fresh_action_domain_ids or ()))
-        if action_init == 'fresh_domain' and not self.fresh_action_domain_ids:
-            raise ValueError(
-                'action_init="fresh_domain" requires '
-                'fresh_action_domain_ids.')
-        missing_allowlist = list(checkpoint_missing_allowlist or ())
-        if action_init == 'fresh_all':
-            missing_allowlist.extend([
-                r'action_in_proj\..*',
-                r'action_out_proj\..*',
-                r'action_modality_embed(?:\.weight)?',
-            ])
-        self.checkpoint_missing_allowlist = tuple(missing_allowlist)
         self.vision_latent_dim = vision_latent_dim
         self.latent_channel = vision_latent_dim
         self.latent_patch_size = latent_patch_size
@@ -174,24 +141,6 @@ class Cosmos3FlowMatching(Cosmos3ComponentsMixin, Cosmos3ScheduleMixin,
         self.base_fps = base_fps
         self.enable_vision_loss = enable_vision_loss
         self.freeze_non_moe_vlm_backbone = bool(freeze_non_moe_vlm_backbone)
-        self.freeze_non_action_components = bool(
-            freeze_non_action_components)
-        # DDPTrainRunner owns PEFT wrapping.  These attributes deliberately
-        # live on the model config/instance so the regular FluxVLA builder can
-        # validate and preserve the LoRA experiment contract.
-        self.use_lora = bool(use_lora)
-        self.lora_rank = int(lora_rank)
-        self.lora_alpha = int(lora_alpha or lora_rank)
-        self.lora_dropout = float(lora_dropout)
-        self.lora_target_modules = lora_target_modules
-        self.modules_to_save = list(modules_to_save or [])
-        if self.use_lora and not self.lora_target_modules:
-            raise ValueError(
-                'use_lora=True requires non-empty lora_target_modules.')
-        if self.freeze_non_action_components and self.freeze_non_moe_vlm_backbone:
-            raise ValueError(
-                'freeze_non_action_components=True conflicts with '
-                'freeze_non_moe_vlm_backbone=True.')
         if vision_vae is None:
             raise ValueError('Cosmos3FlowMatching requires '
                              '`vision_vae=dict('
@@ -246,11 +195,6 @@ class Cosmos3FlowMatching(Cosmos3ComponentsMixin, Cosmos3ScheduleMixin,
         )
         self.action_modality_embed = ActionModalityEmbedding(hidden_size)
         self._validate_projector_shapes()
-        for domain_id in self.fresh_action_domain_ids:
-            if not 0 <= domain_id < self.num_embodiment_domains:
-                raise ValueError(
-                    f'fresh action domain {domain_id} is outside '
-                    f'[0, {self.num_embodiment_domains}).')
         self._init_projection_weights_like_cosmos3()
 
         if self.torch_dtype is not None:
@@ -270,62 +214,30 @@ class Cosmos3FlowMatching(Cosmos3ComponentsMixin, Cosmos3ScheduleMixin,
             'action_out_proj',
             'action_modality_embed',
         ]
-        # This hook also runs when an outer FSDP/PEFT wrapper owns the public
-        # load_state_dict call and recursively loads this Cosmos module.
-        self.register_load_state_dict_post_hook(
-            self._mark_complete_embedded_vae_after_recursive_load)
 
-    def _mark_complete_embedded_vae_after_recursive_load(
-        self,
-        module,
-        incompatible_keys,
-    ) -> None:
-        del module
-        vision_vae = getattr(self, 'vision_vae', None)
-        if vision_vae is None or not vision_vae.state_dict():
+    def from_pretrained(self):
+        if self.pretrained_name_or_path is None:
             return
 
-        def is_vae_key(name: str) -> bool:
-            return (name.startswith('vision_vae.')
-                    or '.vision_vae.' in name)
-
-        incompatible_vae = any(
-            is_vae_key(name) for name in (
-                *incompatible_keys.missing_keys,
-                *incompatible_keys.unexpected_keys,
-            ))
-        if not incompatible_vae:
-            mark_loaded = getattr(vision_vae, 'mark_weights_loaded', None)
-            if callable(mark_loaded):
-                mark_loaded()
-
-    def load_state_dict(self, state_dict, strict: bool = True, assign=False):
-        """Mark an embedded VAE ready after its exact subtree is loaded.
-
-        Serving and evaluation load deployment safetensors through the parent
-        module instead of :meth:`Cosmos3CheckpointMixin.from_pretrained`.
-        PyTorch recursively bypasses the child's public ``load_state_dict``;
-        therefore the parent owns this readiness transition. Non-strict
-        resume is allowed only when every tensor in the VAE subtree is
-        present; a partial VAE can never enable an uninitialized tokenizer.
-        """
-        result = super().load_state_dict(
-            state_dict, strict=strict, assign=assign)
-        vision_vae = getattr(self, 'vision_vae', None)
-        expected_vae_keys = (
-            {f'vision_vae.{name}' for name in vision_vae.state_dict()}
-            if vision_vae is not None else set())
-        loaded_exact_vae = (
-            bool(expected_vae_keys)
-            and expected_vae_keys.issubset(state_dict.keys())
-            and not any(
-                name.startswith('vision_vae.')
-                for name in result.missing_keys))
-        if loaded_exact_vae:
-            mark_loaded = getattr(vision_vae, 'mark_weights_loaded', None)
-            if callable(mark_loaded):
-                mark_loaded()
-        return result
+        vision_vae = self._modules.pop('vision_vae', None)
+        visual = self.vlm_backbone.model._modules.pop('visual', None)
+        skipped_modules = []
+        if vision_vae is not None:
+            skipped_modules.append('VAE')
+        if visual is not None:
+            skipped_modules.append('visual tower')
+        if skipped_modules:
+            overwatch.info(
+                f"Temporarily skipping Cosmos3 {', '.join(skipped_modules)} "
+                'while loading the transformer checkpoint; those weights are '
+                'loaded by their owning modules.')
+        try:
+            super().from_pretrained()
+        finally:
+            if visual is not None:
+                self.vlm_backbone.model._modules['visual'] = visual
+            if vision_vae is not None:
+                self._modules['vision_vae'] = vision_vae
 
     @property
     def config(self):
@@ -381,21 +293,6 @@ class Cosmos3FlowMatching(Cosmos3ComponentsMixin, Cosmos3ScheduleMixin,
         super().freeze_backbones()
         if self.freeze_non_moe_vlm_backbone:
             self._freeze_non_moe_vlm_backbone()
-        if self.freeze_non_action_components:
-            # Action-only means exactly the policy interface is trainable.
-            # The VAE is always frozen by Cosmos3ComponentsMixin.to().
-            for module in (
-                    self.vlm_backbone,
-                    self.vision_vae,
-                    self.time_embedder,
-                    self.vision_in_proj,
-                    self.vision_out_proj,
-            ):
-                if module is not None:
-                    module.requires_grad_(False)
-            self.action_in_proj.requires_grad_(True)
-            self.action_out_proj.requires_grad_(True)
-            self.action_modality_embed.requires_grad_(True)
 
     def forward(
         self,
@@ -408,8 +305,6 @@ class Cosmos3FlowMatching(Cosmos3ComponentsMixin, Cosmos3ScheduleMixin,
         sequence_plan: List[SequencePlan],
         conditioning_fps: Optional[torch.Tensor] = None,
         action_fps: Optional[torch.Tensor] = None,
-        action_masks: Optional[torch.Tensor | List[torch.Tensor]] = None,
-        frame_masks: Optional[torch.Tensor | List[torch.Tensor]] = None,
         **unused_batch_fields,
     ) -> Dict[str, torch.Tensor | List[torch.Tensor]]:
         del unused_batch_fields
@@ -482,13 +377,11 @@ class Cosmos3FlowMatching(Cosmos3ComponentsMixin, Cosmos3ScheduleMixin,
             target_action,
             raw_action_dims,
             packed_seq.action.condition_mask if packed_seq.action else None,
-            valid_mask=action_masks,
         )
         action_loss = raw_action_loss * self.action_loss_weight
 
         outputs: Dict[str, torch.Tensor | List[torch.Tensor]] = {
             'loss': action_loss,
-            'action_loss': action_loss,
             'flow_matching_loss_action': raw_action_loss,
             'preds_action': preds_action,
             'last_hidden_state': last_hidden_state,
@@ -501,11 +394,9 @@ class Cosmos3FlowMatching(Cosmos3ComponentsMixin, Cosmos3ScheduleMixin,
                 target_vision,
                 packed_seq.vision.condition_mask
                 if packed_seq.vision else None,
-                valid_mask=frame_masks,
             )
             vision_loss = raw_vision_loss * self.vision_loss_weight
             outputs['loss'] = outputs['loss'] + vision_loss
-            outputs['vision_loss'] = vision_loss
             outputs['flow_matching_loss_vision'] = raw_vision_loss
             outputs['preds_vision'] = preds_vision
         return outputs

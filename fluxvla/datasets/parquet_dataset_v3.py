@@ -118,24 +118,17 @@ class ParquetDatasetV3(ParquetDataset):
     ``meta/episodes/*.parquet`` and ``stats.json``.
     """
 
-    def __init__(
-            self,
-            data_root_path: Union[str, List[str]],
-            transforms: List[Dict],
-            action_window_size: int = 9,
-            action_key: str = 'observation.state',
-            use_delta: bool = False,
-            statistic_name: str = 'private',
-            window_start_idx: int = 1,
-            frame_window_size: int = 1,
-            frame_sample_stride: int = 1,
-            expose_index: bool = False,
-            require_full_window: bool = False,
-            task_indices: List[int] | None = None,
-            train_episode_fraction: float | None = None,
-            repeat_to_full_length: bool = False,
-            episode_fraction_range: tuple[float, float] | None = None,
-            max_windows: int | None = None) -> None:
+    def __init__(self,
+                 data_root_path: Union[str, List[str]],
+                 transforms: List[Dict],
+                 action_window_size: int = 9,
+                 action_key: str = 'observation.state',
+                 use_delta: bool = False,
+                 statistic_name: str = 'private',
+                 window_start_idx: int = 1,
+                 frame_window_size: int = 1,
+                 frame_sample_stride: int = 1,
+                 expose_index: bool = False) -> None:
         """Initialize a parquet dataset backed by LeRobot v3 metadata.
 
         Args:
@@ -158,27 +151,8 @@ class ParquetDatasetV3(ParquetDataset):
                 frames should span a longer temporal window.
             expose_index (bool): Whether to expose the concatenated row index
                 to transforms for offline sample weighting.
-            require_full_window (bool): If True, resample starts whose action
-                or strided video window crosses an episode or dataset
-                boundary instead of padding the tail.
-            task_indices (list[int], optional): Keep only the requested task
-                indices for single-task smoke training.
-            train_episode_fraction (float): Leading fraction of episodes from
-                each dataset root used for training. This legacy option is
-                mutually exclusive with ``episode_fraction_range``.
-            repeat_to_full_length (bool): Repeat the selected split to retain
-                the original epoch length.
-            episode_fraction_range (tuple[float, float], optional): Normalized
-                half-open episode range ``[start, end)`` selected independently
-                from each data root in original episode order. Empty selections
-                fail fast.
-            max_windows (int, optional): Deterministically retain exactly the
-                first N valid starts after all other filters. Intended for
-                small-set overfit gates.
         """
         Dataset.__init__(self)
-        self._validate_episode_split(train_episode_fraction,
-                                     episode_fraction_range)
         self.action_window_size = action_window_size
         if isinstance(data_root_path, str):
             data_root_path = [data_root_path]
@@ -217,18 +191,6 @@ class ParquetDatasetV3(ParquetDataset):
         self.tasks = all_tasks
         self.episodes = all_episodes
         self.episodes_by_dataset = episodes_by_dataset
-        self.episode_metadata_by_dataset = []
-        for dataset_episodes in episodes_by_dataset:
-            episode_metadata = {}
-            for fallback_index, record in enumerate(dataset_episodes):
-                episode_index = record.get('episode_index', fallback_index)
-                if isinstance(episode_index, np.ndarray):
-                    episode_index = episode_index.item()
-                if isinstance(episode_index,
-                              torch.Tensor) and episode_index.numel() == 1:
-                    episode_index = episode_index.item()
-                episode_metadata[int(episode_index)] = dict(record)
-            self.episode_metadata_by_dataset.append(episode_metadata)
 
         datasets = []
         dataset_sizes = []
@@ -239,6 +201,9 @@ class ParquetDatasetV3(ParquetDataset):
         self.dataset_cumulative_sizes = np.cumsum([0] + dataset_sizes)
         self.dataset = concatenate_datasets(datasets)
         self.full_length = len(self.dataset)
+        self.sample_indices = np.arange(self.full_length, dtype=np.int64)
+        self.effective_length = self.full_length
+        self.transforms = list()
         self.action_key = action_key
         self.use_delta = use_delta
         self.statistic_name = statistic_name
@@ -246,19 +211,6 @@ class ParquetDatasetV3(ParquetDataset):
         self.frame_window_size = frame_window_size
         self.frame_sample_stride = frame_sample_stride
         self.expose_index = expose_index
-        self.require_full_window = require_full_window
-        self.sample_indices = self._build_sample_indices(
-            train_episode_fraction, episode_fraction_range)
-        self.sample_indices = self._filter_task_indices(
-            self.sample_indices, task_indices)
-        self.sample_indices = self._filter_valid_start_indices(
-            self.sample_indices)
-        self.sample_indices = self._limit_sample_windows(
-            self.sample_indices, max_windows)
-        self.effective_length = (
-            self.full_length
-            if repeat_to_full_length else len(self.sample_indices))
-        self.transforms = list()
         for transform in transforms:
             self.transforms.append(build_transform_from_cfg(transform))
 
@@ -290,60 +242,6 @@ class ParquetDatasetV3(ParquetDataset):
 
         return ''
 
-    def _resolve_episode_metadata(self, dataset_idx: int,
-                                  episode_index: int) -> Dict:
-        """Return the per-episode record used by native LeRobot v3 paths."""
-        metadata_by_dataset = getattr(self, 'episode_metadata_by_dataset',
-                                      None)
-        if metadata_by_dataset is None:
-            # Keep lightweight ``__new__`` fixtures and legacy callers that
-            # construct the reader manually backward compatible.
-            return {}
-        try:
-            return dict(metadata_by_dataset[dataset_idx][episode_index])
-        except (IndexError, KeyError) as exc:
-            raise KeyError('Missing episode metadata for dataset '
-                           f'{dataset_idx}, episode {episode_index}.') from exc
-
-    def _invalid_start_index(self, index: int, dataset_idx: int,
-                             data: Dict) -> bool:
-        """Return whether a row cannot start the requested sample windows."""
-        next_index = index + 1
-        if not self._same_episode_and_dataset(next_index, dataset_idx, data):
-            return True
-        next_task = self._resolve_task_description(
-            dataset_idx, self.dataset[next_index])
-        if next_task in ('empty', 'static'):
-            return True
-
-        if not self.require_full_window:
-            return False
-
-        frame_end_offset = (
-            (self.frame_window_size - 1) * self.frame_sample_stride)
-        frame_end_index = index + max(0, frame_end_offset)
-        if not self._same_episode_and_dataset(frame_end_index, dataset_idx,
-                                              data):
-            return True
-
-        # Mirror the action loop below: static rows are skipped rather than
-        # counted, so the true end can be later than the nominal fixed offset.
-        num_actions = 0
-        window_idx = self.window_start_idx
-        while num_actions < self.action_window_size:
-            action_index = index + window_idx
-            if not self._same_episode_and_dataset(action_index, dataset_idx,
-                                                  data):
-                return True
-            action_task = self._resolve_task_description(
-                dataset_idx, self.dataset[action_index])
-            if action_task == 'empty':
-                return True
-            if action_task != 'static':
-                num_actions += 1
-            window_idx += 1
-        return False
-
     def __getitem__(self, index, dataset_statistics):
         """Build one transformed sample from a parquet row.
 
@@ -356,10 +254,22 @@ class ParquetDatasetV3(ParquetDataset):
             Dict: Sample dictionary containing task text, actions, masks,
             metadata, and transform outputs.
         """
-        index = self._resolve_index(index)
         data = self.dataset[index]
         dataset_idx = self._get_dataset_index(index)
-        while self._invalid_start_index(index, dataset_idx, data):
+        while True:
+            if index == len(self.dataset) - 1:
+                needs_resample = True
+            else:
+                next_data = self.dataset[index + 1]
+                next_task = self._resolve_task_description(
+                    dataset_idx, next_data)
+                needs_resample = (
+                    data['episode_index'] != next_data['episode_index']
+                    or self._get_dataset_index(index + 1) != dataset_idx
+                    or next_task in ('empty', 'static'))
+
+            if not needs_resample:
+                break
             index = self._rand_another()
             data = self.dataset[index]
             dataset_idx = self._get_dataset_index(index)
@@ -436,9 +346,6 @@ class ParquetDatasetV3(ParquetDataset):
         data['task_description'] = self._resolve_task_description(
             dataset_idx, data)
         data['data_root'] = self.data_root_path[dataset_idx]
-        episode_index = int(np.asarray(data['episode_index']).item())
-        data['episode_meta'] = self._resolve_episode_metadata(
-            dataset_idx, episode_index)
         for transform in self.transforms:
             data = transform(data)
 

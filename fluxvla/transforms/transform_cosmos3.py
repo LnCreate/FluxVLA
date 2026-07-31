@@ -51,8 +51,6 @@ class SetCosmos3ActionMetadata:
     def __init__(
         self,
         conditioning_fps: Optional[float] = None,
-        action_fps: Optional[float] = None,
-        raw_action_dim: Optional[int] = None,
         prepend_state_to_action: Optional[bool] = None,
         model_path: Optional[str] = None,
     ) -> None:
@@ -61,22 +59,12 @@ class SetCosmos3ActionMetadata:
         # argument so it can be used in that shared pipeline.
         del model_path
         self.conditioning_fps = conditioning_fps
-        self.action_fps = action_fps
-        self.raw_action_dim = raw_action_dim
         self.prepend_state_to_action = prepend_state_to_action
 
     def __call__(self, data: Dict) -> Dict:
         if self.conditioning_fps is not None:
             data['conditioning_fps'] = np.array(
                 self.conditioning_fps, dtype=np.float32)
-        if self.action_fps is not None:
-            data['action_fps'] = np.array(
-                self.action_fps, dtype=np.float32)
-        if self.raw_action_dim is not None:
-            if self.raw_action_dim <= 0:
-                raise ValueError('raw_action_dim must be positive.')
-            data['raw_action_dim'] = np.array(
-                self.raw_action_dim, dtype=np.int64)
         if self.prepend_state_to_action is not None:
             data['prepend_state_to_action'] = bool(
                 self.prepend_state_to_action)
@@ -102,29 +90,6 @@ def build_sequence_plan_from_mode(
     if mode not in valid_modes:
         raise ValueError(f'Invalid mode: {mode!r}. Must be one of '
                          f'{valid_modes}')
-    if video_length < 1:
-        raise ValueError(
-            f'video_length must be positive, got {video_length}.')
-    if action_length < 0:
-        raise ValueError(
-            f'action_length must be non-negative, got {action_length}.')
-    if video_temporal_downsample < 1:
-        raise ValueError('video_temporal_downsample must be positive, got '
-                         f'{video_temporal_downsample}.')
-    if num_history_actions < 0 or num_history_actions > action_length:
-        raise ValueError(
-            'num_history_actions must be in [0, action_length], got '
-            f'{num_history_actions} for action_length={action_length}.')
-
-    base_action_length = action_length - num_history_actions
-    valid_action_lengths = (video_length - 1, video_length)
-    if base_action_length not in valid_action_lengths:
-        raise ValueError(
-            'Cosmos3 sequence plans require the non-history action length '
-            'to equal video_length - 1 or video_length, got '
-            f'action_length={action_length}, '
-            f'num_history_actions={num_history_actions}, '
-            f'video_length={video_length}.')
 
     # Determine if action should be included based on mode
     # image2video mode: no action (pure image-to-video generation)
@@ -147,6 +112,7 @@ def build_sequence_plan_from_mode(
     # forward_dynamics: all action steps are clean (conditioning)
     # inverse_dynamics/policy: action is supervised (predicted)
     # History frames (prepended) are always conditioning.
+    base_action_length = action_length - num_history_actions
     if mode == 'forward_dynamics':
         condition_frame_indexes_action = list(range(action_length))
     # This currently assumes that the action length is the same as the video
@@ -226,9 +192,6 @@ class ProcessCosmos3Prompt:
         model_path: Optional[str] = None,
         output_key: str = 'text_token_ids',
         output_attention_mask_key: Optional[str] = None,
-        negative_output_key: Optional[str] = None,
-        expected_vocab_size: Optional[int] = None,
-        expected_special_token_ids: Optional[Dict[str, int]] = None,
         *args,
         **kwargs,
     ) -> None:
@@ -243,10 +206,6 @@ class ProcessCosmos3Prompt:
         self.action_metadata = action_metadata
         self.output_key = output_key
         self.output_attention_mask_key = output_attention_mask_key
-        self.negative_output_key = negative_output_key
-        self.expected_vocab_size = expected_vocab_size
-        self.expected_special_token_ids = dict(
-            expected_special_token_ids or {})
 
         # Lazy-initialised to avoid heavy imports at registry load time.
         self._tokenizer = None
@@ -260,34 +219,7 @@ class ProcessCosmos3Prompt:
                 raise TypeError(
                     'ProcessCosmos3Prompt requires a tokenizer with '
                     'apply_chat_template().')
-            self._validate_tokenizer_contract(self._tokenizer)
         return self._tokenizer
-
-    def _validate_tokenizer_contract(self, tokenizer) -> None:
-        if self.expected_vocab_size is not None:
-            actual_vocab_size = getattr(tokenizer, 'vocab_size', None)
-            if actual_vocab_size != self.expected_vocab_size:
-                raise ValueError(
-                    'Cosmos3 tokenizer vocab mismatch: expected '
-                    f'{self.expected_vocab_size}, got {actual_vocab_size}.')
-        resolvers = {
-            'pad_token_id': lambda: getattr(tokenizer, 'pad_token_id', None),
-            'bos_token_id': lambda: getattr(tokenizer, 'bos_token_id', None),
-            'eos_token_id': lambda: getattr(tokenizer, 'eos_token_id', None),
-            'start_of_generation': lambda: tokenizer.convert_tokens_to_ids(
-                '<|vision_start|>'),
-            'end_of_generation': lambda: tokenizer.convert_tokens_to_ids(
-                '<|vision_end|>'),
-        }
-        for name, expected in self.expected_special_token_ids.items():
-            if name not in resolvers:
-                raise ValueError(
-                    f'Unsupported tokenizer contract field {name!r}.')
-            actual = resolvers[name]()
-            if actual != expected:
-                raise ValueError(
-                    f'Cosmos3 tokenizer {name} mismatch: expected '
-                    f'{expected}, got {actual}.')
 
     def _append_sentence(self, caption: str, sentence: str) -> str:
         sentence = sentence.strip()
@@ -393,41 +325,41 @@ class ProcessCosmos3Prompt:
             data[self.caption_key] = caption
 
         # Build chat-template messages (no image/video tokens)
-        def tokenize_chat(content: str):
-            conversations = []
-            if self.use_system_prompt:
-                conversations.append({
-                    'role': 'system',
-                    'content': 'You are a helpful robot assistant.',
-                })
-            conversations.append({'role': 'user', 'content': content})
-            try:
-                return tokenizer.apply_chat_template(
-                    conversations,
-                    tokenize=True,
-                    add_generation_prompt=True,
-                    add_vision_id=False,
-                    return_dict=False,
-                )
-            except TypeError:
-                return tokenizer.apply_chat_template(
-                    conversations,
-                    tokenize=True,
-                    add_generation_prompt=True,
-                    return_dict=False,
-                )
+        conversations = []
+        if self.use_system_prompt:
+            conversations.append({
+                'role':
+                'system',
+                'content':
+                'You are a helpful robot assistant.',
+            })
+        conversations.append({'role': 'user', 'content': caption})
 
-        token_ids = tokenize_chat(caption)
+        try:
+            token_ids = tokenizer.apply_chat_template(
+                conversations,
+                tokenize=True,
+                add_generation_prompt=True,
+                # add_vision_id=False is specific to processors that
+                # expose it (Qwen3VLProcessor).  For a plain tokenizer
+                # the kwarg is harmless or absent – use a try/except.
+                add_vision_id=False,
+                return_dict=False,
+            )
+        except TypeError:
+            # Fallback for tokenizers that don't accept add_vision_id
+            token_ids = tokenizer.apply_chat_template(
+                conversations,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=False,
+            )
 
         # Truncate to max_len.  Eval pipelines can request a matching mask
         # under `lang_masks`, while training keeps the compact token-only key.
         token_ids = token_ids[:self.max_len]
 
         data[self.output_key] = np.array(token_ids, dtype=np.int64)
-        if self.negative_output_key is not None:
-            negative_ids = tokenize_chat('')[:self.max_len]
-            data[self.negative_output_key] = np.array(
-                negative_ids, dtype=np.int64)
         if self.output_attention_mask_key is not None:
             data[self.output_attention_mask_key] = np.ones(
                 len(token_ids), dtype=np.bool_)
@@ -509,24 +441,6 @@ class BuildCosmos3Sequence:
                 f'dim={action.shape[-1]}. Run NormalizeStatesAndActions '
                 'before BuildCosmos3Sequence.')
 
-        action_mask = data.get('action_masks')
-        if action_mask is not None:
-            action_mask = np.asarray(action_mask, dtype=np.bool_)
-            if action_mask.shape != (action.shape[0], ):
-                raise ValueError(
-                    'BuildCosmos3Sequence expects action_masks to have '
-                    f'shape [{action.shape[0]}], got {action_mask.shape}.')
-
-        frame_mask = data.get('frame_masks')
-        if frame_mask is not None:
-            frame_mask = np.asarray(frame_mask, dtype=np.bool_)
-            if frame_mask.shape != (self.frame_window_size, ):
-                raise ValueError(
-                    'BuildCosmos3Sequence expects frame_masks to have '
-                    f'shape [{self.frame_window_size}], got '
-                    f'{frame_mask.shape}.')
-            data['frame_masks'] = frame_mask
-
         if self.prepend_state_to_action:
             state = np.asarray(data[self.state_key], dtype=action.dtype)
             if state.ndim != 1:
@@ -541,9 +455,6 @@ class BuildCosmos3Sequence:
                     f'{state.shape[-1]}. Run NormalizeStatesAndActions '
                     'before BuildCosmos3Sequence.')
             action = np.concatenate([state[None, :], action], axis=0)
-            if action_mask is not None:
-                action_mask = np.concatenate(
-                    [np.ones(1, dtype=np.bool_), action_mask])
 
         history_action = data.pop('history_action', None)
         num_history_actions = 0
@@ -560,10 +471,6 @@ class BuildCosmos3Sequence:
                     f'{history_action.shape[-1]}.')
             num_history_actions = int(history_action.shape[0])
             action = np.concatenate([history_action, action], axis=0)
-            if action_mask is not None:
-                action_mask = np.concatenate([
-                    np.ones(num_history_actions, dtype=np.bool_), action_mask
-                ])
 
         embodiment_id = int(np.asarray(data['embodiment_ids']).item())
         if embodiment_id < 0:
@@ -578,8 +485,6 @@ class BuildCosmos3Sequence:
             num_history_actions=num_history_actions,
         )
         data['actions'] = action
-        if action_mask is not None:
-            data['action_masks'] = action_mask
         data['raw_action_dim'] = np.array(self.raw_action_dim, dtype=np.int64)
         data['sequence_plan'] = seq_plan
         data['conditioning_fps'] = np.array(

@@ -204,7 +204,6 @@ class Cosmos3MoTBackbone(Qwen3VLForConditionalGeneration):
     """
 
     _tied_weights_keys = ['lm_head.weight']
-    architecture_family = 'qwen3_vl'
 
     def __init__(
         self,
