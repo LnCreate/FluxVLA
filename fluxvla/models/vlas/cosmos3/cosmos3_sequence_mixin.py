@@ -14,7 +14,7 @@ import torch
 
 from fluxvla.models.third_party_models.cosmos3.data.vfm.sequence_packing import (
     GenerationDataClean, PackedSequence, SequencePlan, pack_input_sequence)
-from .flow_utils import _move_packed_sequence_to_device
+from .cosmos3_flow_utils import _move_packed_sequence_to_device
 
 
 class Cosmos3SequenceMixin:

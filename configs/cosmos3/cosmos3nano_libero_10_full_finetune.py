@@ -19,12 +19,15 @@
 #     --config configs/cosmos3/cosmos3nano_libero_10_full_finetune.py
 #
 # LIBERO-specific settings:
-# * LIBERO: action_dim=7 (eef pos/rot + gripper), max_state_dim=64, 2 views.
+# * LIBERO: action_dim=10 (eef pos + rot6d + gripper),
+#   max_state_dim=64, 2 views.
 # * Video keys: observation.images.image + observation.images.wrist_image.
 # * Single dataset group (no multi-embodiment split).
 # * Cosmos3 uses LIBERO embodiment_id=5 for the action projector.
-# * 128×128 image resolution (same as other VLAs on LIBERO for fair
-#   comparison).
+# * 256×128 concat-view video (two 128×128 views: third-person left,
+#   wrist right).
+from copy import deepcopy
+
 _ckpt_root = './checkpoints'
 _cosmos3_nano_ckpt = _ckpt_root + '/Cosmos3-Nano'
 _cosmos3_nano_transformer = _cosmos3_nano_ckpt + '/transformer'
@@ -43,20 +46,52 @@ _vision_vae = dict(
 )
 
 # LIBERO robot spec
-_action_dim = 7  # eef_pos(3) + eef_ori(3) + gripper(1)
+_action_dim = 10  # eef_pos(3) + eef_rot6d(6) + gripper(1)
 _max_action_dim = 64  # Normalize target action width / Cosmos3 projector width
 _max_state_dim = 64  # Normalize target state width
 _action_horizon = 16
 _frame_window_size = _action_horizon + 1
 _prepend_state_to_action = False
 _image_height = 128
-_image_width = 128  # each view; PrepareVideo tiles two views vertically
-_video_height = _image_height * 2
-_video_width = _image_width
-_conditioning_fps = 20.0  # LIBERO is recorded at ~20 fps
+_image_width = 128  # each view; PrepareVideo tiles two views horizontally
+_video_height = _image_height
+_video_width = _image_width * 2
+_conditioning_fps = 20.0  # Official LIBERO action-policy stats use 20 FPS
+_libero_action_stats = dict(
+    mean=[
+        0.050704, 0.097407, -0.094833, 0.994873, -0.004579, -0.004288,
+        0.004389, 0.996104, 0.001109, 0.476725
+    ],
+    std=[
+        0.333621, 0.387175, 0.45714, 0.010807, 0.077802, 0.063386, 0.078571,
+        0.009994, 0.038504, 0.49946
+    ],
+    min=[
+        -0.9375, -0.9375, -0.9375, 0.902028, -0.356085, -0.367416, -0.370434,
+        0.921907, -0.255, 0.0
+    ],
+    max=[
+        0.9375, 0.9375, 0.9375, 1.0, 0.368853, 0.341214, 0.356395, 1.0,
+        0.348251, 1.0
+    ],
+    q01=[
+        -0.723214, -0.808929, -0.9375, 0.934955, -0.223431, -0.189878,
+        -0.334735, 0.938516, -0.107736, 0.0
+    ],
+    q99=[
+        0.9375, 0.870536, 0.9375, 1.0, 0.331, 0.163153, 0.226216, 1.0,
+        0.127158, 1.0
+    ],
+)
 _cfg_dropout_rate = 0.1
-_base_lr = 2e-4 * 0.4  # Cosmos3 action SFT uses lr=2e-4 with f_max=0.4
+_base_lr = 5e-5  # Official Cosmos3 LIBERO action-policy base LR
 _action_lr = _base_lr * 5.0
+# Official LIBERO-10 trains for 2000 optimizer steps at global batch 2048.
+# With 16 GPUs, per-device batch 32 and 4-step accumulation match that batch.
+_per_device_batch_size = 32
+_grad_accumulation_steps = 4
+_max_steps = 2000
+_save_iter_interval = 500
 _vision_vae['encode_exact_durations'] = [_frame_window_size]
 
 _cosmos3_nano_special_tokens = dict(
@@ -199,7 +234,7 @@ model = dict(
         train_time_video_distribution='waver',
         train_time_action_distribution='logitnormal',
         train_time_weight='uniform',
-        vision_loss_weight=1.0,
+        vision_loss_weight=10.0,  # Official LIBERO recipe: loss_scale=10.0
         independent_action_schedule=False,
         shift_action=None,
         use_high_sigma_strategy=False,
@@ -237,6 +272,11 @@ model = dict(
     enable_vision_loss=True,
 )
 
+inference_model = deepcopy(model)
+# Eval builds the VAE without the external Wan2.2 file; the finetuned
+# checkpoint already carries the frozen VAE weights.
+inference_model['vision_vae']['pretrained_name_or_path'] = None
+
 _transforms = [
     dict(
         type='ProcessParquetInputs',
@@ -258,6 +298,7 @@ _transforms = [
         },
         embodiment_id=5,
     ),
+    dict(type='LiberoFramewiseActionToRot6D'),
     dict(
         type='ProcessCosmos3Prompt',
         tokenizer=_cosmos3_nano_tokenizer,
@@ -281,12 +322,13 @@ _transforms = [
         state_dim=_max_state_dim,
         state_key='proprio',
         action_key='action',
-        norm_type='mean_std',
+        state_norm_type='none',
+        action_norm_type='quantile',
     ),
     dict(
         type='BuildCosmos3Sequence',
         raw_action_dim=_action_dim,
-        mode='joint',
+        mode='wam',
         frame_window_size=_frame_window_size,
         prepend_state_to_action=_prepend_state_to_action,
         conditioning_fps=_conditioning_fps,
@@ -295,11 +337,12 @@ _transforms = [
         type='PrepareVideo',
         num_views=2,
         frame_window_size=_frame_window_size,
+        tile_direction='horizontal',
     ),
 ]
 
 train_dataloader = dict(
-    per_device_batch_size=8,
+    per_device_batch_size=_per_device_batch_size,
     per_device_num_workers=4,
     dataset=dict(
         type='DistributedRepeatingDataset',
@@ -309,6 +352,8 @@ train_dataloader = dict(
         },
         statistic_keys=['observation.state', 'timestamp', 'action'],
         statistic_name='libero_10_no_noops',
+        statistics_overrides=dict(
+            libero_10_no_noops=dict(action=_libero_action_stats)),
         datasets=dict(
             type='ParquetDataset',
             data_root_path='./datasets/libero_10_no_noops_lerobotv2.1',
@@ -326,7 +371,9 @@ train_dataloader = dict(
 
 runner = dict(
     type='FSDPTrainRunner',
-    max_epochs=10,
+    max_steps=_max_steps,
+    save_iter_interval=_save_iter_interval,
+    max_keep_ckpts=2,
     optimizer=dict(
         lr=_base_lr,
         type='AdamW',
@@ -334,6 +381,7 @@ runner = dict(
         betas=(0.9, 0.99),
         eps=1e-8,
         fused=True,
+        exclude_1d_from_weight_decay=False,
         paramwise_learning_rate={
             'action_in_proj.': _action_lr,
             'action_out_proj.': _action_lr,
@@ -357,16 +405,19 @@ runner = dict(
         pad_id=0,
     ),
     sampler=None,
+    grad_accumulation_steps=_grad_accumulation_steps,
     metric=dict(
         type='VLAMetric',
         active_trackers=('jsonl', 'wandb'),
         run_dir='work_dirs',
-        grad_accumulation_steps=1,
+        grad_accumulation_steps=_grad_accumulation_steps,
         window_size=1,
     ),
     lr_scheduler=dict(
-        type='linear-warmup+cosine-decay',
-        warmup_ratio=0.0,
+        type='linear-warmup+linear-decay',
+        warmup_steps=500,
+        # Matches official Cosmos3 LIBERO cycle_lengths=[16000].
+        cycle_length=16000,
     ),
     enable_gradient_checkpointing=True,
     enable_mixed_precision_training=True,
@@ -379,8 +430,7 @@ eval = dict(
     type='LiberoEvalRunner',
     task_suite_name='libero_10',
     model_family='cosmos3',
-    eval_chunk_size=10,
-    resize_size=128,
+    eval_chunk_size=_action_horizon,
     num_trials_per_task=50,
     num_steps_wait=10,
     seed=7,
@@ -394,6 +444,7 @@ eval = dict(
             dict(
                 type='ProcessLiberoEvalInputs',
                 img_keys=['agentview_image', 'robot0_eye_in_hand_image'],
+                resize_size=_image_height,
                 embodiment_id=5,
             ),
             dict(
@@ -425,24 +476,16 @@ eval = dict(
                 output_attention_mask_key='lang_masks',
             ),
             dict(
-                type='LiberoProprioFromInputs',
-                norm_type='mean_std',
-                state_dim=_max_state_dim,
-                pos_key='robot0_eef_pos',
-                quat_key='robot0_eef_quat',
-                gripper_key='robot0_gripper_qpos',
-                out_key='states',
-            ),
-            dict(
                 type='PrepareVideo',
                 num_views=2,
                 frame_window_size=1,
+                tile_direction='horizontal',
             ),
         ],
     ),
     denormalize_action=dict(
-        type='DenormalizeLiberoAction',
-        norm_type='mean_std',
+        type='DenormalizeLiberoFramewiseRot6DAction',
+        norm_type='quantile_rot',
         action_dim=_action_dim,
     ),
 )

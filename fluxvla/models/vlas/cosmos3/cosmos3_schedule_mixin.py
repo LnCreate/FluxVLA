@@ -16,7 +16,7 @@ from fluxvla.models.third_party_models.cosmos3.data.vfm.sequence_packing import 
     PackedSequence, SequencePlan)
 from fluxvla.models.third_party_models.cosmos3.model.vfm.diffusion.rectified_flow import \
     TrainTimeSampler
-from .flow_utils import _get_vision_data_resolution
+from .cosmos3_flow_utils import _get_vision_data_resolution
 
 
 class Cosmos3ScheduleMixin:

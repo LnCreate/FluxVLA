@@ -27,6 +27,8 @@ Main transforms:
 """
 
 from __future__ import annotations
+import json
+import math
 import os
 import random
 from typing import Dict, Optional
@@ -143,10 +145,11 @@ class ProcessCosmos3Prompt:
     """Prepare and tokenise a Cosmos3 text prompt.
 
     Action SFT configs can pass ``action_metadata`` to mirror the official
-    Cosmos3 action text pipeline: viewpoint text, duration/FPS text, and
-    resolution text are appended before CFG dropout and Qwen3-VL chat-template
-    tokenization.  The prompt remains text-only; observation images are not
-    inserted into the reasoner prompt.
+    Cosmos3 action text pipeline.  By default, viewpoint text, duration/FPS
+    text, and resolution text are appended before CFG dropout and Qwen3-VL
+    chat-template tokenization.  With ``format_prompt_as_json=True``, the same
+    metadata is serialized as the official structured action JSON prompt.
+    Observation images are not inserted into the reasoner prompt.
 
     Args:
         tokenizer (dict): FluxVLA tokenizer config. The built tokenizer must
@@ -160,6 +163,8 @@ class ProcessCosmos3Prompt:
             empty string (classifier-free guidance training).  Defaults to 0.0.
         action_metadata (dict, optional): Metadata append settings.  When set,
             follows the official action SFT order before tokenization.
+        format_prompt_as_json (bool): Serialize action metadata as the official
+            Cosmos3 action JSON prompt instead of appending plain text.
     """
 
     DEFAULT_VIEWPOINT_TEMPLATES = {
@@ -184,6 +189,7 @@ class ProcessCosmos3Prompt:
         cfg_dropout_rate: float = 0.0,
         caption_key: str = 'task_description',
         action_metadata: Optional[Dict] = None,
+        format_prompt_as_json: bool = False,
         model_path: Optional[str] = None,
         output_key: str = 'text_token_ids',
         output_attention_mask_key: Optional[str] = None,
@@ -199,6 +205,7 @@ class ProcessCosmos3Prompt:
         self.cfg_dropout_rate = cfg_dropout_rate
         self.caption_key = caption_key
         self.action_metadata = action_metadata
+        self.format_prompt_as_json = format_prompt_as_json
         self.output_key = output_key
         self.output_attention_mask_key = output_attention_mask_key
 
@@ -237,9 +244,104 @@ class ProcessCosmos3Prompt:
             return self.action_metadata[key]
         return data.get(key, default)
 
+    def _ensure_sentence(self, text: str) -> str:
+        text = text.strip()
+        return text if text.endswith(('.', '!', '?')) else f'{text}.'
+
+    def _format_time_mss(self, seconds: int) -> str:
+        minutes, seconds = divmod(max(seconds, 0), 60)
+        return f'{minutes}:{seconds:02d}'
+
+    def _aspect_ratio(self, width: int, height: int) -> str:
+        divisor = math.gcd(width, height)
+        if divisor == 0:
+            raise ValueError('ProcessCosmos3Prompt cannot format aspect '
+                             f'ratio for {height}x{width}.')
+        return f'{width // divisor},{height // divisor}'
+
+    def _json_viewpoint_text(self, data: Dict, viewpoint: str) -> str:
+        viewpoint_text = self.DEFAULT_VIEWPOINT_TEMPLATES.get(viewpoint, '')
+        if (self.action_metadata
+                and 'viewpoint_description' in self.action_metadata):
+            viewpoint_description = self.action_metadata[
+                'viewpoint_description']
+        else:
+            viewpoint_description = data.pop('additional_view_description',
+                                             None)
+        if viewpoint_description:
+            separator = ' ' if viewpoint_text.endswith('.') else '. '
+            viewpoint_text = (
+                viewpoint_text + separator +
+                str(viewpoint_description).strip())
+        return viewpoint_text
+
+    def _format_action_json_prompt(self, caption: str, data: Dict) -> str:
+        if not self.action_metadata or caption == '':
+            return caption
+
+        viewpoint = self._action_metadata_value(data, 'viewpoint',
+                                                'concat_view')
+        data['viewpoint'] = viewpoint
+        fps = self._scalar_float(
+            self._action_metadata_value(data, 'conditioning_fps'),
+            'conditioning_fps',
+        )
+        num_frames = int(
+            self._scalar_float(
+                self._action_metadata_value(
+                    data, 'frame_window_size',
+                    self._action_metadata_value(data, 'num_frames')),
+                'frame_window_size',
+            ))
+        if fps <= 0:
+            raise ValueError('ProcessCosmos3Prompt requires positive '
+                             f'conditioning_fps, got {fps}.')
+
+        height = self._action_metadata_value(data, 'video_height')
+        width = self._action_metadata_value(data, 'video_width')
+        if height is None or width is None:
+            image_size = data.get('image_size')
+            if image_size is not None:
+                height, width = image_size[:2]
+        height = int(self._scalar_float(height, 'video_height'))
+        width = int(self._scalar_float(width, 'video_width'))
+
+        action_length = int(
+            self._scalar_float(
+                self._action_metadata_value(
+                    data, 'action_horizon',
+                    data.get('action_horizon', num_frames - 1)),
+                'action_horizon',
+            ))
+        duration_seconds = num_frames / fps
+        action_end_time = round(duration_seconds)
+        prompt = {
+            'cinematography': {
+                'framing': self._json_viewpoint_text(data, viewpoint),
+            },
+            'actions': [{
+                'time': f'0:00-{self._format_time_mss(action_end_time)}',
+                'description': self._ensure_sentence(caption),
+                'idle_frame': f'0 out of {action_length}.',
+            }],
+            'duration':
+            f'{int(duration_seconds)}s',
+            'fps':
+            float(fps),
+            'resolution': {
+                'H': height,
+                'W': width,
+            },
+            'aspect_ratio':
+            self._aspect_ratio(width, height),
+        }
+        return json.dumps(prompt)
+
     def _append_action_metadata(self, caption: str, data: Dict) -> str:
         if not self.action_metadata or caption == '':
             return caption
+        if self.format_prompt_as_json:
+            return self._format_action_json_prompt(caption, data)
 
         append_viewpoint = self.action_metadata.get('append_viewpoint', True)
         append_duration_fps = self.action_metadata.get('append_duration_fps',

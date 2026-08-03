@@ -69,7 +69,7 @@ recipe name; the model freezes the understanding pathway and trains the
 generation/action pathway (`freeze_non_moe_vlm_backbone=True`).
 
 Single-suite recipes run for 2000 optimizer steps; mixed training runs for
-5000. On eight GPUs, per-device batch 64 with 4 accumulation steps gives the
+5000. On eight GPUs, per-device batch 8 with 32 accumulation steps gives the
 target global batch size 2048 without reducing the configured image
 resolution.
 

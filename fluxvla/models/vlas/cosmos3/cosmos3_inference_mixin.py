@@ -16,8 +16,8 @@ import torch
 
 from fluxvla.models.third_party_models.cosmos3.data.vfm.sequence_packing import \
     SequencePlan
-from .flow_utils import (_as_text_ids, _expand_sampler_timestep,
-                         _sample_arch_invariant_noise)
+from .cosmos3_flow_utils import (_as_text_ids, _expand_sampler_timestep,
+                                 _sample_arch_invariant_noise)
 
 
 @dataclass

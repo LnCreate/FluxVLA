@@ -16,8 +16,8 @@ from fluxvla.models.backbones.vlms.cosmos3.cosmos3_attention import \
     build_packed_sequence
 from fluxvla.models.third_party_models.cosmos3.data.vfm.sequence_packing import (
     PackedSequence, get_all_seq)
-from .flow_utils import (_apply_timestep_embeds_to_noisy_tokens,
-                         _as_list_of_1chw)
+from .cosmos3_flow_utils import (_apply_timestep_embeds_to_noisy_tokens,
+                                 _as_list_of_1chw)
 
 
 class Cosmos3CodecMixin:

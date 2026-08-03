@@ -14,11 +14,11 @@ the native DROID recipe:
 
 * current state + 32 future actions with 33 observation frames;
 * ``prepend_state_to_action=True`` so action row 0 is clean conditioning;
-* native Cosmos3 ``mode='joint'`` sampling over policy, forward dynamics, and
-  inverse dynamics;
+* native Cosmos3 ``mode='wam'`` policy-only sampling (DROID recipe);
 * Cosmos3-style action prompt metadata for viewpoint, duration/FPS, and
   resolution;
 * CFG text dropout at 0.1;
+* vision flow-matching loss weighted 10x (DROID ``loss_scale=10.0``);
 * DROID-style shared image augmentation across all views/frames;
 * a DROID-like three-view canvas: front view on top, two wrist views below.
 
@@ -27,9 +27,6 @@ Intentional diffs from native DROID:
 * ALOHA actions are 14D dual-arm joint states normalized with FluxVLA stats;
   DROID uses raw 8D single-arm joint commands.
 * ALOHA data is treated as 30 FPS; DROID policy uses 15 FPS.
-* FluxVLA currently uses AdamW runners without native FusedAdam action-head
-  LR multipliers. The scalar optimizer settings below use a conservative
-  effective-LR approximation of the DROID recipe.
 """
 
 from copy import deepcopy
@@ -60,6 +57,8 @@ _video_height = 336
 _video_width = 224
 _conditioning_fps = 30.0
 _cfg_dropout_rate = 0.1
+_base_lr = 8e-5  # DROID: 2e-4 x LambdaLinear f_max=0.4
+_action_lr = _base_lr * 5.0  # DROID: 5x action-head LR
 _viewpoint_description = (
     'The top row shows the high camera view looking at the dual-arm ALOHA '
     'workspace. The bottom row contains two horizontally concatenated '
@@ -220,7 +219,6 @@ model = dict(
         train_time_video_distribution='waver',
         train_time_action_distribution='logitnormal',
         train_time_weight='uniform',
-        vision_loss_weight=1.0,
         independent_action_schedule=False,
         shift_action=None,
         use_high_sigma_strategy=False,
@@ -231,6 +229,7 @@ model = dict(
         use_discrete_rf=False,
         normalize_loss_by_active=False,
         action_loss_weight=10.0,
+        vision_loss_weight=10.0,  # DROID loss_scale=10.0
     ),
     rectified_flow_inference_config=_rectified_flow_inference_config,
     timestep_scale=0.001,
@@ -246,10 +245,15 @@ model = dict(
     vision_vae=_vision_vae,
     ori_action_dim=_action_dim,
     action_horizon=_action_horizon,
-    freeze_vlm_backbone=True,
+    # DROID: moe_gen + heads only.
+    freeze_vlm_backbone=False,
+    freeze_non_moe_vlm_backbone=True,
     enable_vision_loss=True,
 )
 inference_model = deepcopy(model)
+# Eval builds the VAE without the external Wan2.2 file; the finetuned
+# checkpoint already carries the frozen VAE weights.
+inference_model['vision_vae']['pretrained_name_or_path'] = None
 
 _transforms = [
     dict(
@@ -309,7 +313,7 @@ _transforms = [
     dict(
         type='BuildCosmos3Sequence',
         raw_action_dim=_action_dim,
-        mode='joint',
+        mode='wam',  # DROID: policy-only
         frame_window_size=_frame_window_size,
         prepend_state_to_action=_prepend_state_to_action,
         conditioning_fps=_conditioning_fps,
@@ -356,7 +360,19 @@ runner = dict(
     type='FSDPTrainRunner',
     max_steps=None,
     max_epochs=6,
-    optimizer=dict(lr=1e-4, type='AdamW', weight_decay=0.05),
+    optimizer=dict(
+        lr=_base_lr,
+        type='AdamW',
+        weight_decay=0.05,
+        betas=(0.9, 0.99),
+        eps=1e-8,
+        fused=True,
+        exclude_1d_from_weight_decay=False,
+        paramwise_learning_rate={
+            'action_in_proj.': _action_lr,
+            'action_out_proj.': _action_lr,
+            'action_modality_embed': _action_lr,
+        }),
     max_grad_norm=1.0,
     save_iter_interval=1000,
     max_keep_ckpts=3,
@@ -385,8 +401,9 @@ runner = dict(
         window_size=1,
     ),
     lr_scheduler=dict(
-        type='linear-warmup+cosine-decay',
-        warmup_ratio=0.0,
+        # Linear decay over the epoch-based run.
+        type='linear-warmup+linear-decay',
+        warmup_steps=0,
     ),
     enable_gradient_checkpointing=True,
     enable_mixed_precision_training=True,

@@ -23,16 +23,18 @@ from fluxvla.models.third_party_models.cosmos3.model.vfm.mot import \
     modeling_utils
 from fluxvla.tokenizers.cosmos3_wan22_vae import Cosmos3Wan22VAE
 from .base_vla import BaseVLA
-from .cosmos3.codec_mixin import Cosmos3CodecMixin
-from .cosmos3.components_mixin import Cosmos3ComponentsMixin
-from .cosmos3.flow_utils import (_as_action_list, _as_long_list, _as_text_ids,
-                                 merge_config, read_json_if_exists,
-                                 resolve_inference_config, resolve_torch_dtype,
-                                 resolve_training_config)
-from .cosmos3.inference_mixin import Cosmos3InferenceMixin
-from .cosmos3.loss_mixin import Cosmos3LossMixin
-from .cosmos3.schedule_mixin import Cosmos3ScheduleMixin
-from .cosmos3.sequence_mixin import Cosmos3SequenceMixin
+from .cosmos3.cosmos3_codec_mixin import Cosmos3CodecMixin
+from .cosmos3.cosmos3_components_mixin import Cosmos3ComponentsMixin
+from .cosmos3.cosmos3_flow_utils import (_as_action_list, _as_long_list,
+                                         _as_text_ids, merge_config,
+                                         read_json_if_exists,
+                                         resolve_inference_config,
+                                         resolve_torch_dtype,
+                                         resolve_training_config)
+from .cosmos3.cosmos3_inference_mixin import Cosmos3InferenceMixin
+from .cosmos3.cosmos3_loss_mixin import Cosmos3LossMixin
+from .cosmos3.cosmos3_schedule_mixin import Cosmos3ScheduleMixin
+from .cosmos3.cosmos3_sequence_mixin import Cosmos3SequenceMixin
 
 SequencePlan = sequence_packing.SequencePlan
 TimestepEmbedder = modeling_utils.TimestepEmbedder

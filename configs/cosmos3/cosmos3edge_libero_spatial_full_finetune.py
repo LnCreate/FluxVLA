@@ -427,7 +427,7 @@ runner = dict(
         type='Cosmos3Collator'),
     enable_gradient_checkpointing=True,
     enable_mixed_precision_training=True,
-    grad_accumulation_steps=4,
+    grad_accumulation_steps=32,
     lr_scheduler=dict(
         cycle_length=16000,
         type='linear-warmup+linear-decay',
@@ -441,7 +441,7 @@ runner = dict(
             'jsonl',
             'wandb',
         ),
-        grad_accumulation_steps=4,
+        grad_accumulation_steps=32,
         run_dir='work_dirs',
         type='VLAMetric',
         window_size=1),
@@ -593,5 +593,5 @@ train_dataloader = dict(
                     ]))
         },
         type='DistributedRepeatingDataset'),
-    per_device_batch_size=64,
+    per_device_batch_size=8,
     per_device_num_workers=4)
