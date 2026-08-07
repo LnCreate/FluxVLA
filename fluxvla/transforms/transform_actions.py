@@ -86,6 +86,25 @@ def _rot6d_to_matrix(rot6d: np.ndarray) -> np.ndarray:
     return _normalize_rotation_matrices(matrix).reshape(*original_shape, 3, 3)
 
 
+def _quaternion_xyzw_to_matrix(quaternion: np.ndarray) -> np.ndarray:
+    quaternion = np.asarray(quaternion, dtype=np.float32)
+    quaternion = quaternion / np.linalg.norm(
+        quaternion, axis=-1, keepdims=True).clip(min=1e-8)
+    x, y, z, w = np.moveaxis(quaternion, -1, 0)
+    return np.stack((
+        1 - 2 * (y * y + z * z),
+        2 * (x * y - z * w),
+        2 * (x * z + y * w),
+        2 * (x * y + z * w),
+        1 - 2 * (x * x + z * z),
+        2 * (y * z - x * w),
+        2 * (x * z - y * w),
+        2 * (y * z + x * w),
+        1 - 2 * (x * x + y * y),
+    ),
+                    axis=-1).reshape(*quaternion.shape[:-1], 3, 3)
+
+
 def _matrix_to_axisangle(matrix: np.ndarray) -> np.ndarray:
     matrix = np.asarray(matrix, dtype=np.float32)
     if matrix.shape[-2:] != (3, 3):
@@ -200,6 +219,53 @@ class LiberoFramewiseActionToRot6D:
             return data
         data[self.action_key] = _libero_axisangle_action_to_rot6d(
             data[self.action_key])
+        return data
+
+
+@TRANSFORMS.register_module()
+class DualAbsoluteEEPoseToRelativeRot6D:
+    """Convert future dual-arm eeposes to frame-wise 20D actions."""
+
+    def __init__(self,
+                 state_key: str = 'states',
+                 action_key: str = 'actions',
+                 frame_stride: int = 2,
+                 gripper_open_threshold: float = 0.06) -> None:
+        self.state_key = state_key
+        self.action_key = action_key
+        self.frame_stride = frame_stride
+        self.gripper_open_threshold = gripper_open_threshold
+
+    def __call__(self, data: Dict) -> Dict:
+        current = np.asarray(data[self.state_key], dtype=np.float32)
+        future = np.asarray(data[self.action_key], dtype=np.float32)
+        if current.shape[-1] != 16 or future.shape[-1] != 16:
+            raise ValueError('Dual-arm eepose with grippers must have '
+                             '16 dimensions.')
+
+        future = future[self.frame_stride - 1::self.frame_stride]
+        previous = np.concatenate((current[None], future[:-1]), axis=0)
+        arm_actions = []
+        for offset in (0, 8):
+            delta_position = (
+                future[:, offset:offset + 3] - previous[:, offset:offset + 3])
+            previous_rotation = _quaternion_xyzw_to_matrix(
+                previous[:, offset + 3:offset + 7])
+            future_rotation = _quaternion_xyzw_to_matrix(future[:, offset +
+                                                                3:offset + 7])
+            relative_rotation = (
+                future_rotation @ previous_rotation.swapaxes(-1, -2))
+            gripper = (future[:, offset + 7:offset + 8]
+                       >= self.gripper_open_threshold).astype(np.float32)
+            arm_actions.append(
+                np.concatenate((delta_position,
+                                _matrix_to_rot6d(relative_rotation), gripper),
+                               axis=-1))
+
+        data[self.action_key] = np.concatenate(arm_actions, axis=-1)
+        if 'action_masks' in data:
+            data['action_masks'] = data['action_masks'][self.frame_stride -
+                                                        1::self.frame_stride]
         return data
 
 
