@@ -24,8 +24,8 @@
 # * Video keys: observation.images.image + observation.images.wrist_image.
 # * Single dataset group (no multi-embodiment split).
 # * Cosmos3 uses LIBERO embodiment_id=5 for the action projector.
-# * 256×128 concat-view video (two 128×128 views: third-person left,
-#   wrist right).
+# * 192×320 (H×W) model canvas from two W=160, H=192 views:
+#   third-person left, wrist right.
 from copy import deepcopy
 
 _ckpt_root = './checkpoints'
@@ -52,8 +52,12 @@ _max_state_dim = 64  # Normalize target state width
 _action_horizon = 16
 _frame_window_size = _action_horizon + 1
 _prepend_state_to_action = False
-_image_height = 128
-_image_width = 128  # each view; PrepareVideo tiles two views horizontally
+# Official model canvas is 192×320 (H×W): 256×256 views → 256×512 concat →
+# aspect-preserving resize to W=320, H=160 + reflection pad to H=192. Here
+# each view is resized to W=160, H=192 up front, so the horizontal tile is
+# already W=320, H=192 (stretch instead of resize+pad; same token count).
+_image_height = 192
+_image_width = 160
 _video_height = _image_height
 _video_width = _image_width * 2
 _conditioning_fps = 20.0  # Official LIBERO action-policy stats use 20 FPS
@@ -87,9 +91,10 @@ _cfg_dropout_rate = 0.1
 _base_lr = 5e-5  # Official Cosmos3 LIBERO action-policy base LR
 _action_lr = _base_lr * 5.0
 # Follow the official LIBERO-10 step schedule at global batch 2048.
-# With 16 GPUs, per-device batch 32 and 4-step accumulation match that batch.
-_per_device_batch_size = 32
-_grad_accumulation_steps = 4
+# 192×320 (H×W) canvas ≈ 1.9x the old lowered tokens → per-device 16;
+# 16 GPUs × 16 × 8 accum = 2048 (8 GPUs: use grad_accumulation_steps=16).
+_per_device_batch_size = 16
+_grad_accumulation_steps = 8
 _max_steps = 2000
 _save_iter_interval = 500
 _vision_vae['encode_exact_durations'] = [_frame_window_size]
@@ -304,6 +309,7 @@ _transforms = [
         tokenizer=_cosmos3_nano_tokenizer,
         max_len=512,
         cfg_dropout_rate=_cfg_dropout_rate,
+        format_prompt_as_json=True,
         action_metadata=dict(
             append_viewpoint=False,
             frame_window_size=_frame_window_size,
@@ -454,9 +460,11 @@ eval = dict(
             ),
             dict(
                 type='TransformImage',
-                image_resize_strategy='resize-naive',
-                input_sizes=[[3, _image_height, _image_width],
-                             [3, _image_height, _image_width]],
+                # input_sizes use (C, W, H) PIL ordering: per-view W=160,
+                # H=192, tiling to the 192×320 (H×W) training canvas.
+                image_resize_strategy='resize-crop',
+                input_sizes=[[3, _image_width, _image_height],
+                             [3, _image_width, _image_height]],
                 means=[[127.5, 127.5, 127.5], [127.5, 127.5, 127.5]],
                 stds=[[127.5, 127.5, 127.5], [127.5, 127.5, 127.5]],
             ),
@@ -465,6 +473,7 @@ eval = dict(
                 tokenizer=_cosmos3_nano_tokenizer,
                 max_len=512,
                 cfg_dropout_rate=0.0,
+                format_prompt_as_json=True,
                 action_metadata=dict(
                     append_viewpoint=False,
                     frame_window_size=_frame_window_size,
