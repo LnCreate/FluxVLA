@@ -1461,6 +1461,63 @@ class ConvertPILImageToNumpyArray:
 
 
 @TRANSFORMS.register_module()
+class ResizeAndReflectPad:
+    """Aspect-preserving resize + reflection pad to an exact canvas.
+
+    Mirrors the official Cosmos3 ``reflection_pad_to_target``: resize so the
+    spatial dims fit within ``(height, width)`` while preserving the aspect
+    ratio (scale capped at 1.0), then reflection-pad the bottom/right edge to
+    the exact canvas size (edge-pad when the pad exceeds the content dim).
+    Handles ``[C, H, W]`` or ``[C, T, H, W]`` numpy/torch tensors.
+    """
+
+    def __init__(
+            self,
+            height: int,
+            width: int,
+            keys: Tuple[str, ...] = ('images', 'pixel_values'),
+    ) -> None:
+        self.height = int(height)
+        self.width = int(width)
+        self.keys = keys
+
+    def _snap(self, tensor: torch.Tensor) -> torch.Tensor:
+        orig_h, orig_w = tensor.shape[-2:]
+        scale = min(self.width / orig_w, self.height / orig_h, 1.0)
+        new_h = int(scale * orig_h + 0.5)
+        new_w = int(scale * orig_w + 0.5)
+        if (new_h, new_w) != (orig_h, orig_w):
+            tensor = torch.nn.functional.interpolate(
+                tensor,
+                size=(new_h, new_w),
+                mode='bicubic',
+                align_corners=False,
+                antialias=True,
+            )
+        pad_bottom = self.height - new_h
+        pad_right = self.width - new_w
+        if pad_bottom or pad_right:
+            mode = ('reflect'
+                    if min(pad_bottom, pad_right) < min(new_h, new_w) else
+                    'replicate')
+            tensor = torch.nn.functional.pad(
+                tensor, (0, pad_right, 0, pad_bottom), mode=mode)
+        return tensor
+
+    def __call__(self, data: dict) -> dict:
+        for key in self.keys:
+            if key not in data:
+                continue
+            tensor = data[key]
+            was_numpy = isinstance(tensor, np.ndarray)
+            if was_numpy:
+                tensor = torch.from_numpy(np.ascontiguousarray(tensor))
+            snapped = self._snap(tensor)
+            data[key] = snapped.numpy() if was_numpy else snapped
+        return data
+
+
+@TRANSFORMS.register_module()
 class PrepareVideo:
     """Reshape multi-view / temporal image arrays into ``[C, T, H, W]``.
 

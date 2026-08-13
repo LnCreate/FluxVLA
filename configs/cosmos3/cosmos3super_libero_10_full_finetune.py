@@ -18,8 +18,9 @@ LIBERO-specific settings:
 * Video keys: observation.images.image + observation.images.wrist_image.
 * Single dataset group (no multi-embodiment split).
 * Cosmos3 uses LIBERO embodiment_id=5 for the action projector.
-* 192×320 (H×W) model canvas from two W=160, H=192 views:
-  third-person left, wrist right.
+* 192×320 (H×W) model canvas: two 256×256 views → 512×256 concat →
+  aspect-preserving resize + bottom reflection pad; third-person left,
+  wrist right.
 """
 
 from copy import deepcopy
@@ -48,14 +49,12 @@ _max_state_dim = 64  # Normalize target state width
 _action_horizon = 16
 _frame_window_size = _action_horizon + 1
 _prepend_state_to_action = False
-# Official model canvas is 192×320 (H×W): 256×256 views → 256×512 concat →
-# aspect-preserving resize to W=320, H=160 + reflection pad to H=192. Here
-# each view is resized to W=160, H=192 up front, so the horizontal tile is
-# already W=320, H=192 (stretch instead of resize+pad; same token count).
-_image_height = 192
-_image_width = 160
-_video_height = _image_height
-_video_width = _image_width * 2
+# Official pipeline: 256×256 views → 512×256 concat → aspect-preserving
+# resize to 320×160 + bottom reflection pad (32px) → 192×320 (H×W) canvas.
+_image_height = 256
+_image_width = 256  # per view; official image_size=256
+_video_height = 192
+_video_width = 320
 _conditioning_fps = 20.0  # Official LIBERO action-policy stats use 20 FPS
 _cfg_dropout_rate = 0.1
 _libero_action_stats = dict(
@@ -340,6 +339,11 @@ _transforms = [
         frame_window_size=_frame_window_size,
         tile_direction='horizontal',
     ),
+    dict(
+        type='ResizeAndReflectPad',
+        height=_video_height,
+        width=_video_width,
+    ),
 ]
 
 train_dataloader = dict(
@@ -455,8 +459,7 @@ eval = dict(
             ),
             dict(
                 type='TransformImage',
-                # input_sizes use (C, W, H) PIL ordering: per-view W=160,
-                # H=192, tiling to the 192×320 (H×W) training canvas.
+                # input_sizes use (C, W, H) PIL ordering; per-view 256×256.
                 image_resize_strategy='resize-crop',
                 input_sizes=[[3, _image_width, _image_height],
                              [3, _image_width, _image_height]],
@@ -484,6 +487,11 @@ eval = dict(
                 num_views=2,
                 frame_window_size=1,
                 tile_direction='horizontal',
+            ),
+            dict(
+                type='ResizeAndReflectPad',
+                height=_video_height,
+                width=_video_width,
             ),
         ],
     ),
