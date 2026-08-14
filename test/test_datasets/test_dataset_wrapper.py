@@ -17,6 +17,7 @@ import unittest
 import numpy as np
 
 from fluxvla.datasets.dataset_wrapper import DistributedRepeatingDataset
+from fluxvla.datasets.parquet_dataset import ParquetDataset
 
 
 class TestDistributedRepeatingDatasetStatistics(unittest.TestCase):
@@ -197,6 +198,79 @@ class TestDistributedRepeatingDatasetStatistics(unittest.TestCase):
 
         np.testing.assert_allclose(combined['mean'], [3.0, 4.0, 5.0, 3.0])
         np.testing.assert_allclose(combined['q25'], [3.0, 4.0, 5.0, 3.0])
+
+
+class _EpisodeBlockDataset:
+
+    stats = []
+
+    def __init__(self):
+        self.values = list(range(8))
+
+    def __len__(self):
+        return len(self.values)
+
+    def __getitem__(self, index, _statistics):
+        return self.values[index]
+
+    def get_shuffle_blocks(self):
+        return [(0, 3), (3, 2), (5, 3)]
+
+
+class TestDistributedRepeatingDatasetEpisodeShuffle(unittest.TestCase):
+
+    def test_preserves_order_inside_episode_blocks(self):
+        wrapper = DistributedRepeatingDataset.__new__(
+            DistributedRepeatingDataset)
+        wrapper.shuffle = True
+        wrapper.reshuffle_each_epoch = True
+        wrapper.shuffle_by_episode = True
+        wrapper.seed = 42
+        wrapper.rank = 0
+        wrapper.world_size = 1
+        wrapper._epoch = 0
+        wrapper.is_grouped = False
+        wrapper.is_list = False
+        wrapper.dataset = _EpisodeBlockDataset()
+        wrapper.dataset_statistics = {}
+        wrapper.total_len = len(wrapper.dataset)
+
+        iterator = iter(wrapper)
+        first_epoch = [next(iterator) for _ in range(8)]
+        second_epoch = [next(iterator) for _ in range(8)]
+
+        valid_blocks = ([0, 1, 2], [3, 4], [5, 6, 7])
+        for epoch in (first_epoch, second_epoch):
+            cursor = 0
+            seen = []
+            while cursor < len(epoch):
+                block = next(block for block in valid_blocks
+                             if block[0] == epoch[cursor])
+                self.assertEqual(epoch[cursor:cursor + len(block)], block)
+                seen.append(block[0])
+                cursor += len(block)
+            self.assertCountEqual(seen, [0, 3, 5])
+        self.assertNotEqual(first_epoch, second_epoch)
+
+
+class TestParquetDatasetFullWindowIndex(unittest.TestCase):
+
+    def test_filters_episode_tails_before_sampling(self):
+        dataset = ParquetDataset.__new__(ParquetDataset)
+        dataset.full_length = 38
+        dataset._episode_indices = np.array([0] * 20 + [1] * 18)
+        dataset.dataset_cumulative_sizes = np.array([0, 38])
+        dataset.frame_window_size = 17
+        dataset.window_start_idx = 0
+        dataset.action_window_size = 16
+        dataset.require_full_window = True
+        dataset.repeat_to_full_length = False
+
+        dataset.sample_indices = dataset._build_sample_indices(1.0)
+
+        np.testing.assert_array_equal(dataset.sample_indices,
+                                      [0, 1, 2, 3, 20, 21])
+        self.assertEqual(dataset.get_shuffle_blocks(), [(0, 4), (4, 2)])
 
 
 if __name__ == '__main__':

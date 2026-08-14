@@ -176,6 +176,7 @@ inference_model = deepcopy(model)
 
 runner = dict(
     change_key_name=False,
+    ema=dict(enabled=True, iteration_shift=0, rate=0.1),
     collator=dict(
         list_keys=[
             'sequence_plan',
@@ -279,12 +280,18 @@ train_dataloader = dict(
                         'observation.images.image',
                         'observation.images.wrist_image',
                     ]),
-                dict(type='LiberoFramewiseActionToRot6D'),
+                dict(
+                    compute_idle_frames=True,
+                    type='LiberoFramewiseActionToRot6D'),
                 dict(
                     action_metadata=dict(
                         append_viewpoint=False,
                         conditioning_fps=20.0,
                         frame_window_size=17,
+                        viewpoint='concat_view',
+                        viewpoint_description=(
+                            'The left half shows the third-person view; the '
+                            'right half shows the wrist-mounted camera.'),
                         video_height=192,
                         video_width=320),
                     cfg_dropout_rate=0.1,
@@ -370,6 +377,9 @@ train_dataloader = dict(
                         0.226216, 1.0, 0.127158, 1.0
                     ]))
         },
+        reshuffle_each_epoch=True,
+        seed=42,
+        shuffle_by_episode=True,
         type='DistributedRepeatingDataset'),
     per_device_batch_size=8,
     per_device_num_workers=4)
@@ -437,6 +447,10 @@ eval = dict(
                     append_viewpoint=False,
                     conditioning_fps=20.0,
                     frame_window_size=17,
+                    viewpoint='concat_view',
+                    viewpoint_description=(
+                        'The left half shows the third-person view; the right '
+                        'half shows the wrist-mounted camera.'),
                     video_height=192,
                     video_width=320),
                 cfg_dropout_rate=0.0,

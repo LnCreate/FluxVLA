@@ -395,6 +395,11 @@ class BaseTrainRunner(ABC):
         # handling)
         if 'model' in checkpoint_info:
             self._load_model_state(checkpoint_info['model'])
+        if hasattr(self, '_load_ema_state'):
+            if 'ema_model' in checkpoint_info:
+                self._load_ema_state(checkpoint_info['ema_model'])
+            elif hasattr(self, '_reset_ema_from_model'):
+                self._reset_ema_from_model()
 
         # Restore training state
         if 'global_step' in checkpoint_info:
@@ -539,6 +544,15 @@ class BaseTrainRunner(ABC):
                     if os.path.exists(sf_path):
                         os.remove(sf_path)
                         overwatch.info(f'Removed old safetensors: {sf_file}')
+                    regular_sf_file = old_ckpt.replace('.pt',
+                                                       '.regular.safetensors')
+                    regular_sf_path = os.path.join(checkpoint_dir,
+                                                   regular_sf_file)
+                    if os.path.exists(regular_sf_path):
+                        os.remove(regular_sf_path)
+                        overwatch.info(
+                            'Removed old regular-weight safetensors: '
+                            f'{regular_sf_file}')
                 except Exception as e:
                     overwatch.warning(
                         f'Failed to remove checkpoint {old_ckpt}: {e}')
@@ -909,6 +923,8 @@ class BaseTrainRunner(ABC):
             else:
                 raise
         self.lr_scheduler.step(self)
+        if hasattr(self, '_update_ema'):
+            self._update_ema(self.metric.global_step)
         self.optimizer.zero_grad()
 
         # Custom hook for subclasses

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from typing import Dict, List
 
 import numpy as np
@@ -156,6 +157,46 @@ def _libero_rot6d_action_to_axisangle(action: np.ndarray) -> np.ndarray:
                           axis=-1)
 
 
+def _count_libero_idle_frames(action: np.ndarray,
+                              eps_t: float = 1e-3,
+                              eps_r: float = math.radians(5.0),
+                              eps_g: float = 1e-2,
+                              min_streak: int = 3) -> int:
+    """Count official-style idle frames in raw LIBERO rot6d actions."""
+    action = np.asarray(action, dtype=np.float32)
+    if action.ndim != 2 or action.shape[-1] != 10:
+        raise ValueError('LIBERO idle-frame detection expects [T, 10] '
+                         f'rot6d actions, got {action.shape}.')
+    if action.shape[0] == 0:
+        return 0
+
+    translation_idle = np.linalg.norm(action[:, :3], axis=-1) < eps_t
+    rotation = _rot6d_to_matrix(action[:, 3:9])
+    trace = np.trace(rotation, axis1=-2, axis2=-1)
+    rotation_angle = np.arccos(np.clip((trace - 1.0) / 2.0, -1.0, 1.0))
+    rotation_idle = rotation_angle < eps_r
+    gripper = action[:, 9:10]
+    gripper_delta = np.abs(np.diff(gripper, axis=0,
+                                   prepend=gripper[:1])).max(axis=-1)
+    idle = translation_idle & rotation_idle & (gripper_delta < eps_g)
+
+    if min_streak > 1:
+        streak_filtered = np.zeros_like(idle)
+        start = 0
+        while start < len(idle):
+            if not idle[start]:
+                start += 1
+                continue
+            end = start + 1
+            while end < len(idle) and idle[end]:
+                end += 1
+            if end - start >= min_streak:
+                streak_filtered[start:end] = True
+            start = end
+        idle = streak_filtered
+    return int(idle.sum())
+
+
 @TRANSFORMS.register_module()
 class ProcessLiberoActions:
 
@@ -192,14 +233,24 @@ class ProcessLiberoActions:
 class LiberoFramewiseActionToRot6D:
     """Convert LIBERO stored 7D frame-wise deltas to official 10D rot6d."""
 
-    def __init__(self, action_key: str = 'actions') -> None:
+    def __init__(self,
+                 action_key: str = 'actions',
+                 compute_idle_frames: bool = False,
+                 idle_frames_key: str = 'idle_frames') -> None:
         self.action_key = action_key
+        self.compute_idle_frames = bool(compute_idle_frames)
+        self.idle_frames_key = idle_frames_key
 
     def __call__(self, data: Dict) -> Dict:
         if self.action_key not in data:
             return data
-        data[self.action_key] = _libero_axisangle_action_to_rot6d(
-            data[self.action_key])
+        actions = _libero_axisangle_action_to_rot6d(data[self.action_key])
+        data[self.action_key] = actions
+        if self.compute_idle_frames:
+            data[self.idle_frames_key] = np.array(
+                _count_libero_idle_frames(actions), dtype=np.int64)
+            data[f'{self.idle_frames_key}_total'] = np.array(
+                actions.shape[0], dtype=np.int64)
         return data
 
 

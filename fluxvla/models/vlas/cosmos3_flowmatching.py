@@ -284,7 +284,7 @@ class Cosmos3FlowMatching(Cosmos3ComponentsMixin, Cosmos3ScheduleMixin,
 
     @staticmethod
     def _is_vlm_moe_generation_parameter(name: str) -> bool:
-        return 'moe_gen' in name
+        return ('moe_gen' in name or 'k_norm_und_for_gen' in name)
 
     def _freeze_non_moe_vlm_backbone(self) -> None:
         if self.vlm_backbone is None:
@@ -301,9 +301,9 @@ class Cosmos3FlowMatching(Cosmos3ComponentsMixin, Cosmos3ScheduleMixin,
                 frozen_numel += param.numel()
 
         overwatch.info(
-            'Cosmos3 VLM backbone MoE-only tuning enabled: '
-            f'trainable_moe_numel={trainable_numel:,}, '
-            f'frozen_non_moe_numel={frozen_numel:,}.',
+            'Cosmos3 VLM generation-path tuning enabled: '
+            f'trainable_generation_numel={trainable_numel:,}, '
+            f'frozen_other_numel={frozen_numel:,}.',
             ctx_level=1,
         )
 

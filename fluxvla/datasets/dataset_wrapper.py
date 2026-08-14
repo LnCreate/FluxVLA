@@ -51,6 +51,8 @@ class DistributedRepeatingDataset(IterableDataset):
         shuffle (bool): Whether to shuffle the dataset.
         reshuffle_each_epoch (bool): Whether to change the shuffle order
             after each full pass over the local shard. Defaults to False.
+        shuffle_by_episode (bool): Shuffle episode blocks while preserving
+            sequential sample order within each episode. Defaults to False.
         seed (int): Seed for random number generation.
         statistic_name (str): Name for the statistics collection.
         dim (int, optional): Target dimension for padding/copying data.
@@ -66,6 +68,7 @@ class DistributedRepeatingDataset(IterableDataset):
                  name_mappings: Dict = None,
                  shuffle: bool = True,
                  reshuffle_each_epoch: bool = False,
+                 shuffle_by_episode: bool = False,
                  seed: int = 42,
                  statistic_name: str = 'private',
                  dim: Optional[int] = None,
@@ -82,6 +85,7 @@ class DistributedRepeatingDataset(IterableDataset):
                 dataset_statistics = json.load(f)
         self.shuffle = shuffle
         self.reshuffle_each_epoch = reshuffle_each_epoch
+        self.shuffle_by_episode = shuffle_by_episode
         self.seed = seed
         self.statistic_name = statistic_name
         self.dim = dim
@@ -547,10 +551,36 @@ class DistributedRepeatingDataset(IterableDataset):
         total_world = self.world_size * num_workers
         total_rank = self.rank * num_workers + worker_id
 
+        if self.shuffle_by_episode:
+            if self.is_grouped or self.is_list:
+                raise ValueError('shuffle_by_episode currently requires a '
+                                 'single wrapped dataset.')
+            if not hasattr(self.dataset, 'get_shuffle_blocks'):
+                raise ValueError('shuffle_by_episode requires the wrapped '
+                                 'dataset to implement get_shuffle_blocks().')
+            blocks = self.dataset.get_shuffle_blocks()
+            if len(blocks) < total_world:
+                raise ValueError('shuffle_by_episode requires at least one '
+                                 'episode block per rank/worker shard; got '
+                                 f'{len(blocks)} blocks for {total_world} '
+                                 'shards.')
+
         while True:
             epoch = self._epoch
             if self.reshuffle_each_epoch:
                 self._epoch += 1
+
+            if self.shuffle_by_episode:
+                block_order = np.arange(len(blocks))
+                if self.shuffle:
+                    epoch_offset = epoch if self.reshuffle_each_epoch else 0
+                    rng = np.random.default_rng(self.seed + epoch_offset)
+                    rng.shuffle(block_order)
+                for block_idx in block_order[total_rank::total_world]:
+                    start, length = blocks[int(block_idx)]
+                    for idx in range(start, start + length):
+                        yield self._get_item_from_global_idx(idx)
+                continue
 
             # Create indices for the entire virtual concatenated dataset
             indices = np.arange(self.total_len)

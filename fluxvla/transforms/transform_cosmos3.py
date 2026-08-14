@@ -313,6 +313,16 @@ class ProcessCosmos3Prompt:
                     data.get('action_horizon', num_frames - 1)),
                 'action_horizon',
             ))
+        idle_frames = int(
+            self._scalar_float(
+                data.get('idle_frames', 0),
+                'idle_frames',
+            ))
+        idle_frames_total = int(
+            self._scalar_float(
+                data.get('idle_frames_total', action_length),
+                'idle_frames_total',
+            ))
         duration_seconds = num_frames / fps
         action_end_time = round(duration_seconds)
         prompt = {
@@ -320,9 +330,12 @@ class ProcessCosmos3Prompt:
                 'framing': self._json_viewpoint_text(data, viewpoint),
             },
             'actions': [{
-                'time': f'0:00-{self._format_time_mss(action_end_time)}',
-                'description': self._ensure_sentence(caption),
-                'idle_frame': f'0 out of {action_length}.',
+                'time':
+                f'0:00-{self._format_time_mss(action_end_time)}',
+                'description':
+                self._ensure_sentence(caption),
+                'idle_frame':
+                f'{idle_frames} out of {idle_frames_total}.',
             }],
             'duration':
             f'{int(duration_seconds)}s',

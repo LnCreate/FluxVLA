@@ -23,6 +23,7 @@ from torch.distributed.fsdp import (MixedPrecision, ShardingStrategy,
                                     StateDictType)
 
 from ..utils import initialize_overwatch
+from ..utils.ema import ShardedPowerEMA
 from ..utils.root import RUNNERS
 from .base_train_runner import BaseTrainRunner
 
@@ -89,6 +90,7 @@ class FSDPTrainRunner(BaseTrainRunner):
                  change_key_name: bool = False,
                  tokenizer: Optional[Dict] = None,
                  resume_from: Optional[str] = None,
+                 ema: Optional[Dict] = None,
                  args=None,
                  *_unused_args,
                  **kwargs) -> None:
@@ -134,6 +136,9 @@ class FSDPTrainRunner(BaseTrainRunner):
                 f'FSDP Sharding Strategy {sharding_strategy} is not supported!'
             )
         self.change_key_name = change_key_name
+        self.ema_cfg = dict(ema or {})
+        self.ema_enabled = bool(self.ema_cfg.get('enabled', False))
+        self.ema = None
         self.fsdp_state_dict_type = StateDictType.FULL_STATE_DICT
         self.fsdp_save_policy = FullStateDictConfig(
             offload_to_cpu=True, rank0_only=True)
@@ -173,21 +178,18 @@ class FSDPTrainRunner(BaseTrainRunner):
         with FSDP.state_dict_type(self.vla, self.fsdp_state_dict_type,
                                   self.fsdp_save_policy):
             full_vla_state_dict = self.vla.state_dict()
+            full_ema_state_dict = None
+            if self.ema is not None:
+                with self.ema.swap_into(self.vla):
+                    full_ema_state_dict = self.vla.state_dict()
 
             # Iterate through `full_vlm_state_dict` and split
             # `mkey.{full_dotted_path}` -> `mkey: {full_dotted_path}`
-            if self.change_key_name:
-                model_state_dicts = {
-                    mkey: OrderedDict()
-                    for mkey in self.all_module_keys
-                }
-                for key, param in full_vla_state_dict.items():
-                    for mkey in model_state_dicts:
-                        if key.startswith(mprefix := f'{mkey}.'):
-                            model_state_dicts[mkey][key.removeprefix(
-                                mprefix)] = param
-            else:
-                model_state_dicts = full_vla_state_dict
+            model_state_dicts = self._format_full_state_dict(
+                full_vla_state_dict)
+            ema_state_dicts = (
+                self._format_full_state_dict(full_ema_state_dict)
+                if full_ema_state_dict is not None else None)
 
             # Get full optimizer state dict for FSDP
             # FSDP shards optimizer states, so we need to gather the full state
@@ -233,6 +235,12 @@ class FSDPTrainRunner(BaseTrainRunner):
                     'global_step': global_step,
                     'epoch': epoch,
                 }
+                if ema_state_dicts is not None:
+                    checkpoint_dict['ema_model'] = ema_state_dicts
+                    checkpoint_dict['ema'] = {
+                        'rate': self.ema.rate,
+                        'iteration_shift': self.ema.iteration_shift,
+                    }
 
                 # Save scheduler state
                 if self.lr_scheduler is not None:
@@ -251,9 +259,21 @@ class FSDPTrainRunner(BaseTrainRunner):
                 # Save model weights as safetensors for fast loading
                 safetensors_path = checkpoint_path.replace(
                     '.pt', '.safetensors')
-                self._save_model_safetensors(model_state_dicts,
+                inference_state_dict = (
+                    ema_state_dicts
+                    if ema_state_dicts is not None else model_state_dicts)
+                self._save_model_safetensors(inference_state_dict,
                                              safetensors_path)
-                overwatch.info(f'Saved safetensors at: {safetensors_path}')
+                weight_kind = 'EMA' if ema_state_dicts is not None else 'model'
+                overwatch.info(
+                    f'Saved {weight_kind} safetensors at: {safetensors_path}')
+                if ema_state_dicts is not None:
+                    regular_safetensors_path = checkpoint_path.replace(
+                        '.pt', '.regular.safetensors')
+                    self._save_model_safetensors(model_state_dicts,
+                                                 regular_safetensors_path)
+                    overwatch.info('Saved regular-weight safetensors at: '
+                                   f'{regular_safetensors_path}')
 
                 # Create symlink to latest checkpoint
                 latest_ckpt_link = os.path.join(checkpoint_dir,
@@ -270,7 +290,75 @@ class FSDPTrainRunner(BaseTrainRunner):
                     os.remove(latest_sf_link)
                 os.symlink(os.path.abspath(safetensors_path), latest_sf_link)
 
+                if ema_state_dicts is not None:
+                    latest_regular_link = os.path.join(
+                        checkpoint_dir,
+                        'latest-checkpoint.regular.safetensors')
+                    if (os.path.islink(latest_regular_link)
+                            or os.path.exists(latest_regular_link)):
+                        os.remove(latest_regular_link)
+                    os.symlink(
+                        os.path.abspath(regular_safetensors_path),
+                        latest_regular_link)
+
                 self._cleanup_old_checkpoints(checkpoint_dir)
+
+    def _format_full_state_dict(self, state_dict):
+        if not self.change_key_name:
+            return state_dict
+        formatted = {mkey: OrderedDict() for mkey in self.all_module_keys}
+        for key, param in state_dict.items():
+            for mkey in formatted:
+                if key.startswith(mprefix := f'{mkey}.'):
+                    formatted[mkey][key.removeprefix(mprefix)] = param
+        return formatted
+
+    def _flatten_checkpoint_model_state(self, checkpoint_model_state):
+        if not self.change_key_name:
+            return checkpoint_model_state
+        full_state_dict = OrderedDict()
+        for mkey, mstate_dict in checkpoint_model_state.items():
+            for key, param in mstate_dict.items():
+                full_state_dict[f'{mkey}.{key}'] = param
+        return full_state_dict
+
+    def _initialize_ema(self) -> None:
+        if not self.ema_enabled:
+            return
+        self.ema = ShardedPowerEMA(
+            self.vla,
+            rate=float(self.ema_cfg.get('rate', 0.1)),
+            iteration_shift=int(self.ema_cfg.get('iteration_shift', 0)),
+        )
+        local_numel = sum(tensor.numel()
+                          for tensor in self.ema.shadow.values())
+        overwatch.info(
+            'Initialized sharded FP32 Power EMA for local trainable shards: '
+            f'local_numel={local_numel:,}, rate={self.ema.rate}, '
+            f'iteration_shift={self.ema.iteration_shift}.',
+            ctx_level=1)
+
+    def _update_ema(self, iteration: int) -> None:
+        if self.ema is not None:
+            self.ema.update(self.vla, iteration)
+
+    def _reset_ema_from_model(self) -> None:
+        if self.ema is not None:
+            self.ema.copy_from_model(self.vla)
+
+    def _load_ema_state(self, checkpoint_model_state: dict) -> None:
+        if self.ema is None:
+            return
+        checkpoint_model_state = self._flatten_checkpoint_model_state(
+            checkpoint_model_state)
+        with self.ema.swap_into(self.vla):
+            with FSDP.state_dict_type(self.vla, self.fsdp_state_dict_type,
+                                      self.fsdp_save_policy):
+                self.vla.load_state_dict(checkpoint_model_state, strict=False)
+            self.ema.copy_from_model(self.vla)
+        dist.barrier()
+        if overwatch.is_rank_zero():
+            overwatch.info('FSDP EMA state restored from checkpoint')
 
     def run_setup(self, n_train_examples: int) -> None:
         self.vla.from_pretrained()
@@ -398,6 +486,7 @@ class FSDPTrainRunner(BaseTrainRunner):
         # Create Optimizer and LR Scheduler
         # Use base class method to setup optimizer and scheduler
         self._setup_optimizer_and_scheduler(n_train_examples)
+        self._initialize_ema()
 
         # Calculate values for logging
         n_train_examples_rounded = math.ceil(
@@ -460,12 +549,8 @@ class FSDPTrainRunner(BaseTrainRunner):
             # direct state_dict format
             if self.change_key_name and isinstance(checkpoint_model_state,
                                                    dict):
-                # Reconstruct full state dict from module keys
-                full_state_dict = OrderedDict()
-                for mkey, mstate_dict in checkpoint_model_state.items():
-                    for key, param in mstate_dict.items():
-                        full_state_dict[f'{mkey}.{key}'] = param
-                checkpoint_model_state = full_state_dict
+                checkpoint_model_state = self._flatten_checkpoint_model_state(
+                    checkpoint_model_state)
 
             # Load the state dict
             self.vla.load_state_dict(checkpoint_model_state, strict=False)

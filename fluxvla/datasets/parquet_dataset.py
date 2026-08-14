@@ -177,12 +177,6 @@ class ParquetDataset(Dataset):
         self.dataset_cumulative_sizes = np.cumsum([0] + dataset_sizes)
         self.dataset = hf_dataset
         self.full_length = len(self.dataset)
-        self.sample_indices = self._build_sample_indices(
-            train_episode_fraction)
-        self.effective_length = (
-            self.full_length
-            if repeat_to_full_length else len(self.sample_indices))
-        self.transforms = list()
         self.action_key = action_key
         self.use_delta = use_delta
         self.statistic_name = statistic_name
@@ -190,7 +184,16 @@ class ParquetDataset(Dataset):
         self.frame_window_size = frame_window_size
         self.frame_sample_stride = frame_sample_stride
         self.require_full_window = require_full_window
+        self.repeat_to_full_length = repeat_to_full_length
         self.expose_index = expose_index
+        self._episode_indices = np.asarray(
+            self.dataset['episode_index'], dtype=np.int64)
+        self.sample_indices = self._build_sample_indices(
+            train_episode_fraction)
+        self.effective_length = (
+            self.full_length
+            if repeat_to_full_length else len(self.sample_indices))
+        self.transforms = list()
         for transform in transforms:
             self.transforms.append(build_transform_from_cfg(transform))
 
@@ -249,26 +252,67 @@ class ParquetDataset(Dataset):
 
     def _build_sample_indices(self, episode_fraction: float) -> np.ndarray:
         if episode_fraction == 1.0:
-            return np.arange(self.full_length, dtype=np.int64)
+            sample_indices = np.arange(self.full_length, dtype=np.int64)
+        else:
+            sample_indices = []
+            for start, end in zip(self.dataset_cumulative_sizes[:-1],
+                                  self.dataset_cumulative_sizes[1:]):
+                start, end = int(start), int(end)
+                local_episode_indices = self._episode_indices[start:end]
+                ordered_episodes = list(dict.fromkeys(local_episode_indices))
+                keep_count = int(len(ordered_episodes) * episode_fraction)
+                keep_count = max(1, min(keep_count, len(ordered_episodes)))
+                keep_episodes = set(ordered_episodes[:keep_count])
+                sample_indices.extend(
+                    start + offset
+                    for offset, episode in enumerate(local_episode_indices)
+                    if episode in keep_episodes)
+            sample_indices = np.asarray(sample_indices, dtype=np.int64)
 
-        episode_indices = list(self.dataset['episode_index'])
-        sample_indices = []
-        for start, end in zip(self.dataset_cumulative_sizes[:-1],
-                              self.dataset_cumulative_sizes[1:]):
-            start, end = int(start), int(end)
-            local_episode_indices = episode_indices[start:end]
-            ordered_episodes = list(dict.fromkeys(local_episode_indices))
-            keep_count = int(len(ordered_episodes) * episode_fraction)
-            keep_count = max(1, min(keep_count, len(ordered_episodes)))
-            keep_episodes = set(ordered_episodes[:keep_count])
-            sample_indices.extend(
-                start + offset
-                for offset, episode in enumerate(local_episode_indices)
-                if episode in keep_episodes)
+        if self.require_full_window:
+            window_size = max(self.frame_window_size,
+                              self.window_start_idx + self.action_window_size)
+            last_indices = sample_indices + window_size - 1
+            in_bounds = last_indices < self.full_length
+            safe_last_indices = np.minimum(last_indices, self.full_length - 1)
+            same_episode = (
+                self._episode_indices[sample_indices] ==
+                self._episode_indices[safe_last_indices])
+            dataset_ids = np.searchsorted(
+                self.dataset_cumulative_sizes, sample_indices,
+                side='right') - 1
+            last_dataset_ids = np.searchsorted(
+                self.dataset_cumulative_sizes, safe_last_indices,
+                side='right') - 1
+            sample_indices = sample_indices[in_bounds & same_episode &
+                                            (dataset_ids == last_dataset_ids)]
 
-        if not sample_indices:
+        if len(sample_indices) == 0:
             raise ValueError('No samples left after applying episode split.')
         return np.asarray(sample_indices, dtype=np.int64)
+
+    def get_shuffle_blocks(self) -> List[tuple[int, int]]:
+        """Return contiguous per-episode blocks in virtual index space."""
+        if self.repeat_to_full_length:
+            raise ValueError('Episode-block shuffling is incompatible with '
+                             'repeat_to_full_length=True.')
+        blocks = []
+        block_start = 0
+        for pos in range(1, len(self.sample_indices) + 1):
+            at_end = pos == len(self.sample_indices)
+            if not at_end:
+                previous = int(self.sample_indices[pos - 1])
+                current = int(self.sample_indices[pos])
+                same_block = (
+                    current == previous + 1 and self._episode_indices[current]
+                    == self._episode_indices[previous]
+                    and self._get_dataset_index(current)
+                    == self._get_dataset_index(previous))
+                if same_block:
+                    continue
+            blocks.append((block_start, pos - block_start))
+            block_start = pos
+        return blocks
 
     def _resolve_index(self, index: int) -> int:
         sample_index = index % len(self.sample_indices)
@@ -324,8 +368,8 @@ class ParquetDataset(Dataset):
 
     def _same_episode_and_dataset(self, index: int, dataset_idx: int,
                                   data: Dict[str, Any]) -> bool:
-        return (index < len(self.dataset) and data['episode_index']
-                == self.dataset[index]['episode_index']
+        return (index < len(self.dataset)
+                and data['episode_index'] == self._episode_indices[index]
                 and self._get_dataset_index(index) == dataset_idx)
 
     def __getitem__(self, index, dataset_statistics):

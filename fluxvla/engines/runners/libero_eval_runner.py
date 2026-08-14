@@ -389,6 +389,7 @@ class LiberoEvalRunner(BaseEvalRunner):
                  num_inference_steps: int = None,
                  max_steps: int = None,
                  inference_seed: int = None,
+                 prefer_ema_weights: bool = True,
                  allowed_missing_key_prefixes: tuple = (),
                  model_build_device: str = None,
                  model_build_dtype: str = None,
@@ -444,7 +445,10 @@ class LiberoEvalRunner(BaseEvalRunner):
                     except TypeError:
                         checkpoint = torch.load(ckpt_path, map_location='cpu')
                     if isinstance(checkpoint, dict) and 'model' in checkpoint:
-                        state_dict = checkpoint['model']
+                        if (prefer_ema_weights and 'ema_model' in checkpoint):
+                            state_dict = checkpoint['ema_model']
+                        else:
+                            state_dict = checkpoint['model']
                         # Drop optimizer/scheduler state ASAP to reclaim RAM.
                         checkpoint.pop('optimizer_state_dict', None)
                         checkpoint.pop('scheduler_state_dict', None)
@@ -480,6 +484,7 @@ class LiberoEvalRunner(BaseEvalRunner):
         self.num_inference_steps = num_inference_steps
         self.max_steps = max_steps
         self.inference_seed = inference_seed
+        self.prefer_ema_weights = bool(prefer_ema_weights)
         self.model_build_device = model_build_device
         self.model_build_dtype = self._resolve_model_build_dtype(
             model_build_dtype)
